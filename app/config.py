@@ -409,10 +409,11 @@ class Settings(BaseSettings):
 
     @property
     def odds_providers_configured(self) -> list[str]:
+        """Источники коэффициентов, которые настроены (та же логика, что в провайдерах)."""
         configured: list[str] = []
-        if self.winline_api_base:
+        if self.winline_api_base or self.winline_live_api_base:
             configured.append("winline")
-        if self.betboom_api_base:
+        if self.betboom_api_base or self.betboom_live_api_base:
             configured.append("betboom")
         if self.the_odds_api_key and self.the_odds_api_enabled:
             configured.append("theoddsapi")

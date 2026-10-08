@@ -165,6 +165,27 @@ async def start_health_server(bot: Any | None = None) -> web.AppRunner:
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
+def odds_sources_problem() -> str | None:
+    """Проверка источников коэффициентов. None — хотя бы один источник настроен.
+
+    Источник настроен, если задан URL Winline/BetBoom (прематч или лайв) либо задан
+    THE_ODDS_API_KEY и включён THE_ODDS_API_ENABLED=true (см. Settings.odds_providers_configured).
+    """
+    if settings.odds_providers_configured:
+        return None
+
+    hint = ""
+    if settings.the_odds_api_key and not settings.the_odds_api_enabled:
+        hint = " THE_ODDS_API_KEY задан, но THE_ODDS_API_ENABLED=false — включите его."
+    elif settings.the_odds_api_enabled and not settings.the_odds_api_key:
+        hint = " THE_ODDS_API_ENABLED=true, но THE_ODDS_API_KEY пуст."
+    return (
+        "Не настроен ни один источник коэффициентов: задайте WINLINE_API_BASE или BETBOOM_API_BASE "
+        "(или лайв-URL WINLINE_LIVE_API_BASE / BETBOOM_LIVE_API_BASE), либо THE_ODDS_API_KEY "
+        "и THE_ODDS_API_ENABLED=true." + hint + " См. SETUP.md."
+    )
+
+
 async def preflight() -> bool:
     """Проверки до старта: БД, таблицы, ключи. Возвращает True, если можно работать."""
     problems: list[str] = []
@@ -176,11 +197,9 @@ async def preflight() -> bool:
         problems.append("OPENROUTER_API_KEY пуст — LLM-уровни работать не будут")
     if not settings.telegram_bot_token:
         problems.append("TELEGRAM_BOT_TOKEN пуст — рассылка невозможна")
-    if not settings.winline_api_base and not settings.betboom_api_base:
-        problems.append(
-            "Не заданы WINLINE_API_BASE/BETBOOM_API_BASE — кэфы брать негде "
-            "(см. SETUP.md → «Как достать URL букмекера через DevTools»)"
-        )
+    odds_problem = odds_sources_problem()
+    if odds_problem:
+        problems.append(odds_problem)
     if settings.judge_enabled and not settings.judge_model:
         problems.append("JUDGE_ENABLED=true, но JUDGE_MODEL пуст")
 
