@@ -165,6 +165,23 @@ async def start_health_server(bot: Any | None = None) -> web.AppRunner:
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
+def odds_source_problem() -> str | None:
+    """Проблема с источниками кэфов или None, если источник хотя бы один настроен.
+
+    Источник считается настроенным, если задан WINLINE_API_BASE и/или
+    BETBOOM_API_BASE либо THE_ODDS_API_KEY при включённом THE_ODDS_API_ENABLED
+    (см. Settings.odds_providers_configured).
+    """
+    if settings.odds_providers_configured:
+        return None
+    return (
+        "Ни один источник кэфов не настроен — кэфы брать негде. "
+        "Задайте WINLINE_API_BASE и/или BETBOOM_API_BASE "
+        "(см. SETUP.md → «Как достать URL букмекера через DevTools») "
+        "либо THE_ODDS_API_KEY + THE_ODDS_API_ENABLED=true (TheOddsApi)"
+    )
+
+
 async def preflight() -> bool:
     """Проверки до старта: БД, таблицы, ключи. Возвращает True, если можно работать."""
     problems: list[str] = []
@@ -176,11 +193,9 @@ async def preflight() -> bool:
         problems.append("OPENROUTER_API_KEY пуст — LLM-уровни работать не будут")
     if not settings.telegram_bot_token:
         problems.append("TELEGRAM_BOT_TOKEN пуст — рассылка невозможна")
-    if not settings.winline_api_base and not settings.betboom_api_base:
-        problems.append(
-            "Не заданы WINLINE_API_BASE/BETBOOM_API_BASE — кэфы брать негде "
-            "(см. SETUP.md → «Как достать URL букмекера через DevTools»)"
-        )
+    odds_problem = odds_source_problem()
+    if odds_problem:
+        problems.append(odds_problem)
     if settings.judge_enabled and not settings.judge_model:
         problems.append("JUDGE_ENABLED=true, но JUDGE_MODEL пуст")
 
