@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
 from aiogram import Bot
@@ -135,9 +136,15 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=settings.tz)
 
     collect_hours = [hour.strip() for hour in settings.collect_hours.split(",") if hour.strip()]
+
+    # ВАЖНО: задачи регистрируются как coroutine-функция `_safe_job` + args=[имя, фабрика].
+    # AsyncIOExecutor запускает coroutine-функции в event loop и ждёт их; sync-лямбда
+    # `lambda: _safe_job(...)` ушла бы в thread pool и оставила бы coroutine без await
+    # (RuntimeWarning: coroutine '_safe_job' was never awaited) — задачи не выполнялись бы.
     scheduler.add_job(
-        lambda: _safe_job("collect_schedule", job_collect_schedule),
+        _safe_job,
         CronTrigger(hour=",".join(collect_hours), minute=0, timezone=settings.tz),
+        args=["collect_schedule", job_collect_schedule],
         id="collect_schedule",
         name="Сбор расписания (06:00/14:00 МСК)",
         max_instances=1,
@@ -145,8 +152,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=600,
     )
     scheduler.add_job(
-        lambda: _safe_job("refresh_odds", job_refresh_odds),
+        _safe_job,
         IntervalTrigger(minutes=settings.odds_refresh_minutes, timezone=settings.tz),
+        args=["refresh_odds", job_refresh_odds],
         id="refresh_odds",
         name=f"Обновление кэфов (каждые {settings.odds_refresh_minutes} мин)",
         max_instances=1,
@@ -154,8 +162,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=300,
     )
     scheduler.add_job(
-        lambda: _safe_job("prematch_passes", job_prematch_passes),
+        _safe_job,
         IntervalTrigger(minutes=10, timezone=settings.tz),
+        args=["prematch_passes", job_prematch_passes],
         id="prematch_passes",
         name="PASS 1 (T−6ч) / PASS 2 (T−90м) каждые 10 минут",
         max_instances=1,
@@ -163,8 +172,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=240,
     )
     scheduler.add_job(
-        lambda: _safe_job("live_worker", job_live_worker),
+        _safe_job,
         IntervalTrigger(seconds=settings.live_poll_seconds, timezone=settings.tz),
+        args=["live_worker", job_live_worker],
         id="live_worker",
         name=f"Лайв-воркер киберспорта ({settings.live_poll_seconds} с)",
         max_instances=1,
@@ -172,8 +182,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=30,
     )
     scheduler.add_job(
-        lambda: _safe_job("results", job_results),
+        _safe_job,
         CronTrigger(minute=7, timezone=settings.tz),  # ежечасно в :07, чтобы не пересекаться со сбором
+        args=["results", job_results],
         id="results",
         name="Трекер результатов (ежечасно)",
         max_instances=1,
@@ -181,8 +192,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=900,
     )
     scheduler.add_job(
-        lambda: _safe_job("daily_learning", job_daily_learning),
+        _safe_job,
         CronTrigger(hour=settings.calibration_hour, minute=0, timezone=settings.tz),
+        args=["daily_learning", job_daily_learning],
         id="daily_learning",
         name=f"Обучение: калибровка + веса ({settings.calibration_hour}:00 МСК)",
         max_instances=1,
@@ -190,13 +202,14 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
     scheduler.add_job(
-        lambda: _safe_job("self_review", job_self_review),
+        _safe_job,
         CronTrigger(
             day_of_week=settings.self_review_weekday,
             hour=settings.self_review_hour,
             minute=0,
             timezone=settings.tz,
         ),
+        args=["self_review", job_self_review],
         id="self_review",
         name=f"Self-review лиг (вс {settings.self_review_hour}:00 МСК)",
         max_instances=1,
@@ -204,8 +217,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=3600,
     )
     scheduler.add_job(
-        lambda: _safe_job("daily_digest", lambda: job_digest(bot)),
+        _safe_job,
         CronTrigger(hour=settings.digest_hour, minute=settings.digest_minute, timezone=settings.tz),
+        args=["daily_digest", partial(job_digest, bot)],
         id="daily_digest",
         name=f"Дневная сводка ({settings.digest_hour}:{settings.digest_minute:02d} МСК)",
         max_instances=1,
@@ -213,8 +227,9 @@ def create_scheduler(bot: Bot | None = None) -> AsyncIOScheduler:
         misfire_grace_time=900,
     )
     scheduler.add_job(
-        lambda: _safe_job("broadcast", lambda: job_broadcast(bot)),
+        _safe_job,
         IntervalTrigger(minutes=1, timezone=settings.tz),
+        args=["broadcast", partial(job_broadcast, bot)],
         id="broadcast",
         name="Рассылка подтверждённых сигналов",
         max_instances=1,
