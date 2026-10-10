@@ -25,7 +25,7 @@ from aiohttp import web
 from loguru import logger
 from sqlalchemy import text
 
-from app.bot.bot import create_bot, create_dispatcher, notify_admins
+from app.bot.bot import create_bot, create_dispatcher, notify_admins, setup_bot_commands
 from app.config import settings
 from app.db.database import (
     dispose_engine,
@@ -297,6 +297,7 @@ async def run() -> None:
         health_runner = await start_health_server(bot)
 
         if bot is not None:
+            await setup_bot_commands(bot)
             await notify_admins(
                 bot,
                 "🚀 <b>BetSignals запущен</b>\n"

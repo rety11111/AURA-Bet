@@ -42,6 +42,58 @@ class SourceUnavailable(SourceError):
     """Источник недоступен/не сконфигурирован (нет URL, нет ключа, 5xx после ретраев)."""
 
 
+class CircuitBreakerOpen(SourceUnavailable):
+    """Цепь разомкнута: источник временно отключён из-за последовательных сбоев."""
+
+
+class CircuitBreaker:
+    """Паттерн Circuit Breaker для изоляции сбойных внешних API."""
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 4,
+        recovery_time_sec: float = 60.0,
+    ) -> None:
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_time_sec = recovery_time_sec
+        self.consecutive_failures = 0
+        self.state: str = "CLOSED"  # CLOSED | OPEN | HALF_OPEN
+        self.opened_at: float = 0.0
+
+    def before_request(self) -> None:
+        now = time.monotonic()
+        if self.state == "OPEN":
+            if now - self.opened_at >= self.recovery_time_sec:
+                self.state = "HALF_OPEN"
+                logger.info("circuit_breaker: {} переходит в HALF_OPEN (пробный запрос)", self.name)
+            else:
+                remaining = self.recovery_time_sec - (now - self.opened_at)
+                raise CircuitBreakerOpen(
+                    f"{self.name}: circuit breaker OPEN — источник временно отключён на {remaining:.0f}с"
+                )
+
+    def record_success(self) -> None:
+        if self.state != "CLOSED":
+            logger.info("circuit_breaker: {} восстановился → CLOSED", self.name)
+        self.consecutive_failures = 0
+        self.state = "CLOSED"
+
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.failure_threshold:
+            self.state = "OPEN"
+            self.opened_at = time.monotonic()
+            logger.warning(
+                "circuit_breaker: {} зафиксировал {} сбоев подряд → OPEN на {}с",
+                self.name,
+                self.consecutive_failures,
+                self.recovery_time_sec,
+            )
+
+
+
 # --------------------------------------------------------------------------- #
 # Модели обмена данными
 # --------------------------------------------------------------------------- #
@@ -289,6 +341,11 @@ class BaseHttpClient:
         self.timeout = timeout or settings.http_timeout_sec
         self._client: httpx.AsyncClient | None = None
         self._ua_index = random.randrange(max(1, len(settings.user_agents) or 1))
+        self.circuit_breaker = CircuitBreaker(
+            name=self.source_name,
+            failure_threshold=max(3, settings.http_max_retries * 2),
+            recovery_time_sec=60.0,
+        )
 
     # ------------------------------------------------------------- lifecycle
     def _build_client(self) -> httpx.AsyncClient:
@@ -337,41 +394,48 @@ class BaseHttpClient:
         retries: int | None = None,
         polite: bool | None = None,
     ) -> httpx.Response:
+        self.circuit_breaker.before_request()
         full_url = url if url.startswith("http") else f"{self.base_url}{url}"
         attempts = retries or settings.http_max_retries
         polite = self.politeness if polite is None else polite
         last_error: Exception | None = None
 
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(attempts),
-            wait=wait_exponential(multiplier=settings.http_backoff_base_sec, max=settings.http_backoff_max_sec),
-            retry=retry_if_exception_type((httpx.TransportError, httpx.TimeoutException, SourceUnavailable)),
-            reraise=True,
-        ):
-            with attempt:
-                await self._polite_sleep() if polite else None
-                try:
-                    response = await self.client.request(
-                        method,
-                        full_url,
-                        params=params,
-                        headers=self._headers(headers),
-                        json=json_body,
-                    )
-                except (httpx.TransportError, httpx.TimeoutException) as exc:
-                    last_error = exc
-                    logger.warning("{}: сеть/таймаут {} — попытка {}", self.source_name, full_url, attempt.retry_state.attempt_number)
-                    raise
-                if response.status_code in (429, 500, 502, 503, 504):
-                    last_error = SourceUnavailable(f"{self.source_name}: HTTP {response.status_code}")
-                    logger.warning(
-                        "{}: HTTP {} на {} — ретрай {}", self.source_name, response.status_code, full_url,
-                        attempt.retry_state.attempt_number,
-                    )
-                    raise SourceUnavailable(str(last_error))
-                if response.status_code >= 400:
-                    raise SourceError(f"{self.source_name}: HTTP {response.status_code} на {full_url}: {response.text[:200]}")
-                return response
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(attempts),
+                wait=wait_exponential(multiplier=settings.http_backoff_base_sec, max=settings.http_backoff_max_sec),
+                retry=retry_if_exception_type((httpx.TransportError, httpx.TimeoutException, SourceUnavailable)),
+                reraise=True,
+            ):
+                with attempt:
+                    await self._polite_sleep() if polite else None
+                    try:
+                        response = await self.client.request(
+                            method,
+                            full_url,
+                            params=params,
+                            headers=self._headers(headers),
+                            json=json_body,
+                        )
+                    except (httpx.TransportError, httpx.TimeoutException) as exc:
+                        last_error = exc
+                        logger.warning("{}: сеть/таймаут {} — попытка {}", self.source_name, full_url, attempt.retry_state.attempt_number)
+                        raise
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        last_error = SourceUnavailable(f"{self.source_name}: HTTP {response.status_code}")
+                        logger.warning(
+                            "{}: HTTP {} на {} — ретрай {}", self.source_name, response.status_code, full_url,
+                            attempt.retry_state.attempt_number,
+                        )
+                        raise SourceUnavailable(str(last_error))
+                    if response.status_code >= 400:
+                        raise SourceError(f"{self.source_name}: HTTP {response.status_code} на {full_url}: {response.text[:200]}")
+                    self.circuit_breaker.record_success()
+                    return response
+        except Exception:
+            self.circuit_breaker.record_failure()
+            raise
+        self.circuit_breaker.record_failure()
         # Сюда попадаем только если AsyncRetrying исчерпал попытки и reraise не сработал.
         raise SourceUnavailable(f"{self.source_name}: не удалось выполнить запрос ({last_error})")
 
