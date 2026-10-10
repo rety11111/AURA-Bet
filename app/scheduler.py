@@ -77,9 +77,9 @@ async def job_prematch_passes() -> dict[str, int]:
     providers = get_providers()
     counters: dict[str, int] = {}
     async with session_scope() as session:
-        counters["pass1"] = await run_prematch_pass(session, providers, pass_no=1)
+        counters["pass1"] = await run_prematch_pass(session, pass_no=1, providers=providers)
     async with session_scope() as session:
-        counters["pass2"] = await run_prematch_pass(session, providers, pass_no=2)
+        counters["pass2"] = await run_prematch_pass(session, pass_no=2, providers=providers)
     async with session_scope() as session:
         counters["late"] = await run_late_matches(session, providers)
     async with session_scope() as session:
