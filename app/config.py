@@ -192,8 +192,8 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------- free APIs
     liquipedia_user_agent: str = "BetSignalsBot/1.0 (contact: you@example.com)"
-    liquipedia_api_url: str = "https://api.liquipedia.net/api/v3/query"
-    liquipedia_api_key: str = ""  # опционально: v3 может требовать ключ, см. SETUP.md
+    liquipedia_api_url: str = "https://api.liquipedia.net/api/v3"
+    liquipedia_api_key: str = ""  # обязателен для LPDB v3, см. SETUP.md
     opendota_api_base: str = "https://api.opendota.com/api"
     nhl_api_base: str = "https://api-web.nhle.com/v1"
     moneypuck_base_url: str = "https://moneypuck.com/moneypuck/playerData"
@@ -231,6 +231,7 @@ class Settings(BaseSettings):
     odds_min: float = 1.55
     odds_max: float = 4.0
     min_recent_matches: int = 5          # меньше → data_quality="weak"
+    team_match_threshold: float = Field(default=85.0, ge=0.0, le=100.0)  # NHL: порог fuzzy-поиска
     whitelist_enabled: bool = True
     league_whitelist_json: str = ""      # JSON: переопределяет DEFAULT_LEAGUE_WHITELIST
     esports_tier1_only: bool = True

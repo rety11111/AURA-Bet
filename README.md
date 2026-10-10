@@ -163,7 +163,7 @@ python -m app.main                 # запуск: бот + планировщи
 | API-Tennis | матчи, форма, H2H | RapidAPI-ключ + Free Subscribe |
 | MMA RSS (Чемпионат/Спортс) | новости MMA/боксинга → LLM | ничего (можно заменить `RSS_FEEDS`) |
 | OpenDota | Dota 2: лайв, драфт, карты | ничего |
-| Liquipedia | CS2/Dota турниры и tier | `LIQUIPEDIA_USER_AGENT` с реальной почтой |
+| Liquipedia | CS2/Dota турниры и tier | `LIQUIPEDIA_USER_AGENT` с реальной почтой, `LIQUIPEDIA_API_KEY` |
 
 Отказ любого источника изолирован: он логируется, а данные помечаются
 `data_quality="weak"` — сигнал по такому матчу не отправляется. Ни одна ошибка сети

@@ -17,7 +17,7 @@ API; полный список: GET /v4/sports/?apiKey=... (см. scripts/check_
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from loguru import logger
@@ -43,6 +43,7 @@ class TheOddsApiProvider(OddsProvider):
         self._cache = TTLCache(ttl_sec=15 * 60, maxsize=256)
         self._requests_used = 0
         self._events_by_id: dict[str, str] = {}  # event_id → sport key
+        self._odds_payload_cache = TTLCache(ttl_sec=10 * 60, maxsize=32)
         self._log_usage_headers: dict[str, str] = {}
 
     @property
@@ -112,7 +113,7 @@ class TheOddsApiProvider(OddsProvider):
                     continue
                 starts_at = event.get("commence_time")
                 try:
-                    start_dt = datetime.fromisoformat(str(starts_at).replace("Z", "+00:00")).astimezone(timezone.utc)
+                    start_dt = datetime.fromisoformat(str(starts_at).replace("Z", "+00:00")).astimezone(UTC)
                 except (TypeError, ValueError):
                     continue
                 if start_dt.date() not in (day, day.replace(day=day.day)) and start_dt.date() != day:
@@ -149,7 +150,6 @@ class TheOddsApiProvider(OddsProvider):
         for bookmaker in event.get("bookmakers") or []:
             if not isinstance(bookmaker, dict):
                 continue
-            book_title = str(bookmaker.get("title") or bookmaker.get("key") or "book")
             for market in bookmaker.get("markets") or []:
                 if not isinstance(market, dict):
                     continue
@@ -195,41 +195,47 @@ class TheOddsApiProvider(OddsProvider):
             return "away_handicap" if market_type == "handicap" else "away"
         return None
 
+    async def _sport_odds(self, sport_key: str) -> list[dict[str, Any]]:
+        """Один снимок линии на спорт вместо платного HTTP-запроса на каждый матч."""
+        async def factory() -> list[dict[str, Any]]:
+            payload = await self._get(
+                f"/sports/{sport_key}/odds",
+                {"regions": "eu", "markets": "h2h,totals,spreads", "oddsFormat": "decimal"},
+            )
+            if not isinstance(payload, list):
+                raise SourceError(f"{self.provider_name}: неожиданный формат линии")
+            events = [event for event in payload if isinstance(event, dict)]
+            for event in events:
+                if event.get("id") is not None:
+                    self._events_by_id[str(event["id"])] = sport_key
+            return events
+
+        return await self._odds_payload_cache.get_or_set(f"sport:{sport_key}", factory)
+
     async def get_odds(self, match_id: str) -> list[Odd]:
-        sport_key = self._events_by_id.get(str(match_id))
+        match_id = str(match_id)
+        sport_key = self._events_by_id.get(match_id)
         if not sport_key:
-            # Пытаемся найти спорт-ключ по всем известным (стоит запросов — кэшируем).
+            # После перезапуска in-memory индекс пуст; каждый спорт запрашиваем
+            # максимум раз за TTL, а не заново для каждого матча из БД.
             for candidate in set(THE_ODDS_API_SPORT_KEYS.values()):
                 try:
-                    events = await self._get(
-                        f"/sports/{candidate}/odds",
-                        {"regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
-                    )
+                    await self._sport_odds(candidate)
                 except SourceError:
                     continue
-                if isinstance(events, list):
-                    for event in events:
-                        if isinstance(event, dict) and str(event.get("id")) == str(match_id):
-                            sport_key = candidate
-                            self._events_by_id[str(match_id)] = candidate
-                            break
+                sport_key = self._events_by_id.get(match_id)
                 if sport_key:
                     break
         if not sport_key:
             raise SourceError(f"{self.provider_name}: спорт-ключ для события {match_id} не найден")
 
         async def factory() -> list[Odd]:
-            payload = await self._get(
-                f"/sports/{sport_key}/odds",
-                {"regions": "eu", "markets": "h2h,totals,spreads", "oddsFormat": "decimal", "eventIds": match_id},
-            )
-            events = payload if isinstance(payload, list) else []
-            all_odds: list[Odd] = []
-            for event in events:
-                all_odds.extend(self._parse_bookmakers(event))
-            if not all_odds:
+            events = await self._sport_odds(sport_key)
+            event = next((event for event in events if str(event.get("id")) == match_id), None)
+            odds = self._parse_bookmakers(event) if event else []
+            if not odds:
                 logger.warning("{}: кэфы для {} пусты (возможно, событие в другой лиге)", self.provider_name, match_id)
-            return all_odds
+            return odds
 
         return await self._cache.get_or_set(f"odds:{match_id}", factory, ttl_sec=10 * 60)
 

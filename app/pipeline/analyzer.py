@@ -313,25 +313,22 @@ async def _hockey_prediction(
     осознанная деградация, о которой пишет лог.
     """
     nhl = providers.nhl
-    home_abbrev = await nhl.resolve_abbrev(home_name)
-    away_abbrev = await nhl.resolve_abbrev(away_name)
+    home_abbrev = await nhl.resolve_team(home_name)
+    away_abbrev = await nhl.resolve_team(away_name)
 
-    home_xg = await providers.moneypuck.get_team_xg(home_abbrev or home_name)
-    away_xg = await providers.moneypuck.get_team_xg(away_abbrev or away_name)
-
+    # При невозможности сопоставить название с NHL не угадываем команду по
+    # подстроке в MoneyPuck; при отсутствии xG используем реальные голы NHL.
+    home_xg = await providers.moneypuck.get_team_xg(home_abbrev) if home_abbrev else None
+    away_xg = await providers.moneypuck.get_team_xg(away_abbrev) if away_abbrev else None
+    if home_xg is None:
+        home_xg = await nhl.get_team_goal_stats(home_name)
+    if away_xg is None:
+        away_xg = await nhl.get_team_goal_stats(away_name)
     if home_xg is None or away_xg is None:
-        # Фоллбэк: голы за матч из NHL API → синтетические xG-профили.
-        home_gf, home_ga = await nhl.get_team_goals_per_game(home_name)
-        away_gf, away_ga = await nhl.get_team_goals_per_game(away_name)
-        if None in (home_gf, home_ga, away_gf, away_ga):
-            logger.warning(
-                "analyzer: match_id={} — нет хоккейных данных для «{}» / «{}»", match.id, home_name, away_name
-            )
-            return None
-        from app.sources.base import TeamXgStats
-
-        home_xg = TeamXgStats(team=home_name, matches=0, xg_for_per_game=home_gf, xg_against_per_game=home_ga, source="nhl:голы")
-        away_xg = TeamXgStats(team=away_name, matches=0, xg_for_per_game=away_gf, xg_against_per_game=away_ga, source="nhl:голы")
+        logger.warning(
+            "analyzer: match_id={} — нет хоккейных данных для «{}» / «{}»", match.id, home_name, away_name
+        )
+        return None
 
     model = PoissonModel(sport="hockey")
     prediction = await model.predict(home_xg, away_xg, home_advantage=settings.hockey_home_advantage)
@@ -654,7 +651,7 @@ async def build_context(
             "away_team": away_name,
             "starts_at": match.starts_at.isoformat() if match.starts_at else None,
             "status": match.status,
-            "live_stage": match.live_stage,
+            "live_stage": (live_context or {}).get("stage") if is_live else None,
             "data_quality": match.data_quality,
         },
         "odds_lines": odds_lines,
