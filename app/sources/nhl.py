@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from typing import Any
 
 from loguru import logger
@@ -148,14 +147,15 @@ class NhlProvider(StatsProvider):
         key = text.lower()
         if key in index:
             return index[key]
-        match = process.extractOne(key, list(index.keys()), scorer=fuzz.WRatio, score_cutoff=settings.team_match_threshold)
-        if match:
-            return index[match[0]]
-        # Частая ситуация: «Toronto Maple Leafs» против «Maple Leafs» → сравним по подстроке.
-        for name, abbrev in index.items():
-            if SequenceMatcher(None, key, name).ratio() > 0.85 or key in name or name in key:
-                return abbrev
-        return None
+        matches = process.extract(key, list(index), scorer=fuzz.WRatio, score_cutoff=settings.team_match_threshold)
+        if not matches:
+            return None
+        best_name, best_score, _ = matches[0]
+        # Несколько клубов могут иметь одинаково подходящее короткое название
+        # (например, «New York»). Не подменяем отсутствие данных угадыванием.
+        if any(score == best_score and index[name] != index[best_name] for name, score, _ in matches[1:]):
+            return None
+        return index[best_name]
 
     # ------------------------------------------------------------- schedule
     async def _club_schedule(self, team: str, season: str = "now") -> list[dict[str, Any]]:
@@ -298,7 +298,7 @@ class NhlProvider(StatsProvider):
                 continue
             if last_week <= moment <= now:
                 matches_last += 1
-            if moment > last_game or last_game is None:
+            if last_game is None or moment > last_game:
                 last_game = moment
 
         # Ближайшие матчи берём из расписания «now» (оно содержит и будущие игры сезона)

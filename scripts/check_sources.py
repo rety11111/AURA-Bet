@@ -258,8 +258,8 @@ async def probe_liquipedia(ctx: ProbeContext) -> str:
         return "провайдер не создан"
     if not provider.available:
         return (
-            "❌ Недоступен: задайте LIQUIPEDIA_USER_AGENT в формате "
-            '«BetSignalsBot/1.0 (contact: your@email)» — см. SETUP.md'
+            "❌ Недоступен: укажите LIQUIPEDIA_API_KEY и LIQUIPEDIA_USER_AGENT "
+            "с реальным контактом — см. SETUP.md"
         )
     matches = await provider.get_upcoming_matches("cs2", days=3)
     lines = [f"API: {provider.base_url}", f"матчей CS2 на 3 дня: {len(matches)}"]

@@ -1,38 +1,19 @@
-"""Liquipedia — киберспортивные расписания, tier турниров и статистика по картам.
+"""Liquipedia LPDB v3: матчи и tier турниров (нужен выданный Liquipedia API key).
 
-ВАЖНО (честно — обязательно прочитайте перед продакшеном):
-  * У Liquipedia НЕТ стабильного публичного REST API. Используется LPDB API v3
-    (`settings.liquipedia_api_url`), который требует:
-      - корректный User-Agent БЕЗ него запросы блокируются. Формат обязателен:
-        «BetSignalsBot/1.0 (contact: your@email)» — задаётся в .env как
-        LIQUIPEDIA_USER_AGENT (см. .env.example). Наш дефолт — только заглушка.
-      - часто ещё и Api-Key: LIQUIPEDIA_API_KEY. Если ключа нет, а API его требует,
-        мы получим 401/403 — провайдер честно пишет об этом в лог и возвращает пусто,
-        сервис продолжает работать на остальных источниках.
-  * Точные имена таблиц/полей LPDB (`match2`, `match2opponents`, `match2games`,
-    `tournament`) и синтаксис параметров (JSON-массивы для tables/fields/conditions)
-    МОГУТ отличаться в вашей версии API. Парсер ниже устойчив к форме ответа
-    (ищет нужные ключи рекурсивно), а scripts/check_sources.py проверяет вызов
-    на реальном ключе и печатает сырой ответ.
-  * Liquipedia НЕ отдаёт live-счёт матчей — это не источник лайва. Лайв-счёт,
-    драфты и экономику даёт OpenDota (Dota 2), см. sources/opendota.py.
-    Поэтому `get_live_matches` здесь строит «недавно начавшиеся» матчи по дате.
-
-Ограничения LPDB: не более ~1 запроса в 2 секунды с одного IP (мы соблюдаем
-вежливые паузы) и не более 60 запросов в час на ключ по умолчанию.
+v3 использует ресурсные маршруты /match и /tournament, а не /query.
+Live-счёт/драфты берутся из OpenDota, Liquipedia — только календарь.
 """
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from loguru import logger
 
 from app.config import settings
 from app.sources.base import (
-    BaseHttpClient,
+    CircuitBreakerOpen,
     EsportsLiveMatch,
     EsportsProvider,
     MapStats,
@@ -51,7 +32,7 @@ def _parse_datetime(raw: Any) -> datetime | None:
         return None
     if isinstance(raw, (int, float)):
         try:
-            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            return datetime.fromtimestamp(float(raw), tz=UTC)
         except (OverflowError, OSError, ValueError):
             return None
     text = str(raw).strip()
@@ -60,7 +41,7 @@ def _parse_datetime(raw: Any) -> datetime | None:
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y-%m-%d %H:%M"):
         try:
             parsed = datetime.strptime(text.replace("Z", "+0000"), fmt)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
         except ValueError:
             continue
     logger.debug("liquipedia: не удалось разобрать дату {}", raw)
@@ -91,26 +72,6 @@ def deep_find_key(node: Any, key_fragment: str, depth: int = 6) -> list[Any]:
 
     walk(node, 0)
     return found
-
-
-def flatten_rows(payload: Any, wanted: tuple[str, ...] = ("result",)) -> list[dict[str, Any]]:
-    """Достаёт список записей из ответа LPDB (структура может быть разной вложенности)."""
-    rows: list[dict[str, Any]] = []
-    for value in deep_find_key(payload, "result"):
-        if isinstance(value, list):
-            rows.extend(item for item in value if isinstance(item, dict))
-        elif isinstance(value, dict):
-            rows.append(value)
-    if rows:
-        return rows
-    # Фолбэк: сам ответ уже список
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    for key in wanted:
-        value = payload.get(key) if isinstance(payload, dict) else None
-        if isinstance(value, list):
-            rows.extend(item for item in value if isinstance(item, dict))
-    return rows
 
 
 def _team_names_from_row(row: dict[str, Any]) -> list[str]:
@@ -184,23 +145,27 @@ class LiquipediaProvider(EsportsProvider):
         headers = {"Accept": "application/json"}
         if ua:
             headers["User-Agent"] = ua
-        key = (api_key if api_key is not None else settings.liquipedia_api_key or "").strip()
-        if key:
-            # LPDB v3 использует заголовок Api-Key (некоторые инсталляции — Authorization).
-            headers["Api-Key"] = key
-            headers["Authorization"] = f"Api-Key {key}"
-        super().__init__(source_name="liquipedia", base_url=api_url or settings.liquipedia_api_url, headers=headers)
+        self._api_key = (api_key if api_key is not None else settings.liquipedia_api_key or "").strip()
+        if self._api_key:
+            headers["Authorization"] = f"Apikey {self._api_key}"
+        base = (api_url if api_url is not None else settings.liquipedia_api_url).rstrip("/")
+        # Старые Railway-переменные могли сохранить несуществующий маршрут /query.
+        if base.endswith("/query"):
+            base = base.removesuffix("/query")
+            logger.warning("liquipedia: устаревший LIQUIPEDIA_API_URL /query; использую {}", base)
+        super().__init__(source_name="liquipedia", base_url=base, headers=headers)
         self._cache = TTLCache(ttl_sec=settings.cache_ttl_liquipedia_sec)
+        self._disabled_reason: str | None = None
+        self._warned_missing_config = False
 
     @property
     def available(self) -> bool:
-        if not self.base_url:
+        if self._disabled_reason:
             return False
-        if "example.com" in (self.headers.get("User-Agent") or ""):
-            logger.warning(
-                "liquipedia: User-Agent не настроен (LIQUIPEDIA_USER_AGENT). "
-                "Liquipedia блокирует такие запросы — провайдер отключён до настройки .env"
-            )
+        if not self.base_url or not self._api_key or "example.com" in (self.headers.get("User-Agent") or ""):
+            if not self._warned_missing_config:
+                logger.warning("liquipedia: нужен реальный LIQUIPEDIA_USER_AGENT и выданный LIQUIPEDIA_API_KEY; источник отключён")
+                self._warned_missing_config = True
             return False
         return True
 
@@ -208,54 +173,49 @@ class LiquipediaProvider(EsportsProvider):
     async def query(
         self,
         wiki: str,
-        tables: list[str],
-        fields: list[str],
-        conditions: list[list[Any]] | None = None,
-        order: list[str] | None = None,
+        resource: str,
+        *,
+        conditions: str | None = None,
+        order: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        groupby: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Низкоуровневый запрос к LPDB v3.
-
-        Параметры tables/fields/conditions/order/groupby передаются как JSON-массивы
-        (синтаксис LPDB API v3). Если API вернёт 400 из-за формата — смотрите
-        response.text в логе: там будет точная причина.
-        """
-        params: dict[str, Any] = {
-            "wiki": wiki,
-            "tables": json.dumps(tables, ensure_ascii=False),
-            "fields": json.dumps(fields, ensure_ascii=False),
-            "limit": str(limit),
-            "offset": str(offset),
-        }
+        """Один запрос LPDB v3 к ресурсу; ошибку источника не пробрасываем в pipeline."""
+        if not self.available:
+            return []
+        params: dict[str, Any] = {"wiki": wiki, "limit": limit, "offset": offset}
         if conditions:
-            params["conditions"] = json.dumps(conditions, ensure_ascii=False)
+            params["conditions"] = conditions
         if order:
-            params["order"] = json.dumps(order, ensure_ascii=False)
-        if groupby:
-            params["groupby"] = json.dumps(groupby, ensure_ascii=False)
-
+            params["order"] = order
         try:
-            payload = await self.get_json("", params=params, polite=True)
+            payload = await self.get_json(f"/{resource}", params=params, polite=True)
+        except CircuitBreakerOpen:
+            # OPEN — ожидаемое состояние, не логируем на каждый тик и по каждому wiki.
+            return []
         except SourceError as exc:
             message = str(exc)
-            if "401" in message or "403" in message:
+            if any(f"HTTP {code} " in message for code in (401, 403, 404)):
+                self._disabled_reason = message
                 logger.error(
-                    "liquipedia: доступ запрещён ({}). Проверьте LIQUIPEDIA_USER_AGENT и, "
-                    "при необходимости, LIQUIPEDIA_API_KEY. Сырой ответ: {}",
-                    wiki, message[:300],
+                    "liquipedia: постоянная ошибка API ({}); отключён до перезапуска. "
+                    "Проверьте LIQUIPEDIA_API_URL/KEY и доступ к LPDB v3", message[:200],
                 )
             else:
-                logger.warning("liquipedia: запрос не удался для wiki={} ({})", wiki, message[:300])
+                logger.warning("liquipedia: запрос {} wiki={} не удался ({})", resource, wiki, message[:200])
             return []
         except Exception as exc:  # сеть/таймаут — источник просто недоступен
-            logger.warning("liquipedia: сеть/таймаут при запросе wiki={} ({})", wiki, exc)
+            logger.warning("liquipedia: сеть/таймаут при запросе {} wiki={} ({})", resource, wiki, exc)
             return []
 
-        if isinstance(payload, dict) and payload.get("error"):
-            logger.warning("liquipedia: API вернул ошибку для wiki={}: {}", wiki, str(payload["error"])[:300])
-        return flatten_rows(payload)
+        if not isinstance(payload, dict):
+            logger.warning("liquipedia: неожиданный формат ответа {} wiki={}", resource, wiki)
+            return []
+        if payload.get("error"):
+            logger.warning("liquipedia: ошибка API {} wiki={}: {}", resource, wiki, str(payload["error"])[:200])
+            return []
+        rows = payload.get("result")
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
     # ------------------------------------------------------------ расписания
     async def get_upcoming_matches(self, sport: str, days: int = 3) -> list[EsportsLiveMatch]:
@@ -264,30 +224,16 @@ class LiquipediaProvider(EsportsProvider):
         if not wiki:
             logger.debug("liquipedia: спорт '{}' не поддерживается (только dota2/cs2)", sport)
             return []
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         horizon = now + timedelta(days=days)
         key = f"upcoming:{wiki}:{days}"
 
         async def factory() -> list[EsportsLiveMatch]:
             rows = await self.query(
-                wiki=wiki,
-                tables=["match2", "match2opponents"],
-                fields=[
-                    "match2.match2id",
-                    "match2.date",
-                    "match2.finished",
-                    "match2.bestof",
-                    "match2.tournament",
-                    "match2.liquipediatier",
-                    "match2.liquipediatiertype",
-                    "match2.pagename",
-                    "match2opponents.name",
-                    "match2opponents.score",
-                    "match2opponents.match2id",
-                ],
-                conditions=[["match2.finished", "=", "0"]],
-                order=["match2.date ASC"],
-                limit=60,
+                wiki, "match",
+                conditions=f"[[finished::0]] AND [[date::>{now:%Y-%m-%d %H:%M:%S}]] "
+                           f"AND [[date::<{horizon:%Y-%m-%d %H:%M:%S}]]",
+                order="date ASC", limit=60,
             )
             matches: list[EsportsLiveMatch] = []
             for row in rows:
@@ -329,16 +275,13 @@ class LiquipediaProvider(EsportsProvider):
         wiki = WIKI_BY_SPORT.get(sport.lower())
         if not wiki:
             return []
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         async def factory() -> list[EsportsLiveMatch]:
             rows = await self.query(
-                wiki=wiki,
-                tables=["match2", "match2opponents"],
-                fields=["match2.match2id", "match2.date", "match2.finished", "match2.bestof", "match2.tournament", "match2.liquipediatier"],
-                conditions=[["match2.finished", "=", "0"], ["match2.date", ">", (now - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")]],
-                order=["match2.date ASC"],
-                limit=30,
+                wiki, "match",
+                conditions=f"[[finished::0]] AND [[date::>{now - timedelta(hours=6):%Y-%m-%d %H:%M:%S}]]",
+                order="date ASC", limit=30,
             )
             matches: list[EsportsLiveMatch] = []
             for row in rows:
@@ -381,8 +324,8 @@ class LiquipediaProvider(EsportsProvider):
     async def get_map_stats(self, team: str, map_name: str) -> MapStats | None:
         """Винрейт команды по конкретной карте (CS2: Nuke/Mirage/..., Dota: карта = матч).
 
-        Реализация: тянем матчи команды из match2/match2opponents/match2games,
-        оставляем игры, сыгранные на нужной карте, и считаем winrate по раундам.
+        Реализация: /match возвращает вложенные match2opponents и match2games;
+        локально выбираем матчи команды и считаем winrate по раундам.
         Поле `winner` в match2games означает индекс победившего оппонента (1/2).
         """
         team_key = (team or "").strip().lower()
@@ -391,45 +334,26 @@ class LiquipediaProvider(EsportsProvider):
             return None
 
         async def factory() -> MapStats | None:
-            for sport, wiki in WIKI_BY_SPORT.items():
-                rows = await self.query(
-                    wiki=wiki,
-                    tables=["match2games", "match2opponents"],
-                    fields=[
-                        "match2games.map",
-                        "match2games.score1",
-                        "match2games.score2",
-                        "match2games.winner",
-                        "match2games.match2id",
-                        "match2opponents.name",
-                        "match2opponents.match2id",
-                    ],
-                    conditions=[["match2opponents.name", "=", team]],
-                    limit=200,
-                )
+            for wiki in WIKI_BY_SPORT.values():
+                rows = await self.query(wiki, "match", conditions="[[finished::1]]", order="date DESC", limit=200)
                 if not rows:
                     continue
-                row_groups: dict[str, list[dict[str, Any]]] = {}
-                for row in rows:
-                    match_id = str(row.get("match2id") or row.get("match2opponents.match2id") or "")
-                    if not match_id:
-                        continue
-                    row_groups.setdefault(match_id, []).append(row)
-
                 wins = losses = rounds_won = rounds_lost = 0
-                for _, group in row_groups.items():
-                    opponents = _team_names_from_row({"opponent": group})
+                for row in rows:
+                    opponents = _team_names_from_row(row)
                     try:
-                        team_index = next(index for index, name in enumerate(opponents, start=1) if team_key in name.lower())
+                        team_index = next(index for index, name in enumerate(opponents, start=1) if team_key == name.lower())
                     except StopIteration:
-                        team_index = 1
-                    for row in group:
-                        game_map = str(row.get("map") or "").strip().lower()
-                        if map_key not in game_map and game_map not in map_key:
+                        continue
+                    for game in row.get("match2games") or []:
+                        if not isinstance(game, dict):
                             continue
-                        winner = str(row.get("winner") or "").strip()
-                        first = row.get("score1")
-                        second = row.get("score2")
+                        game_map = str(game.get("map") or "").strip().lower()
+                        if not game_map or (map_key not in game_map and game_map not in map_key):
+                            continue
+                        winner = str(game.get("winner") or "").strip()
+                        first = game.get("score1")
+                        second = game.get("score2")
                         try:
                             score_a = int(float(first)) if first not in (None, "") else None
                             score_b = int(float(second)) if second not in (None, "") else None
@@ -479,14 +403,12 @@ class LiquipediaProvider(EsportsProvider):
         async def factory() -> str | None:
             for wiki in WIKI_BY_SPORT.values():
                 rows = await self.query(
-                    wiki=wiki,
-                    tables=["tournament"],
-                    fields=["tournament.name", "tournament.liquipediatier", "tournament.liquipediatiertype"],
-                    conditions=[["tournament.name", "=", name]],
-                    limit=5,
+                    wiki, "tournament", conditions=f"[[name::{name}]]", limit=5,
                 )
                 for row in rows:
                     tiertype = str(row.get("liquipediatiertype") or "").strip()
+                    if str(row.get("name") or "").casefold() != name.casefold():
+                        continue
                     if tiertype and any(marker in tiertype.lower() for marker in NON_TIER_TYPES):
                         return tiertype
                     tier = str(row.get("liquipediatier") or "").strip()
@@ -494,18 +416,6 @@ class LiquipediaProvider(EsportsProvider):
                         return TIER_LABELS[tier]
                     if tier.lower().startswith("s") or "tier 1" in tier.lower():
                         return "S-Tier"
-                # Точное совпадение не нашлось — попробуем по вхождению
-                rows = await self.query(
-                    wiki=wiki,
-                    tables=["tournament"],
-                    fields=["tournament.name", "tournament.liquipediatier", "tournament.liquipediatiertype"],
-                    conditions=[["tournament.name", "LIKE", f"%{name}%"]],
-                    limit=5,
-                )
-                for row in rows:
-                    tier = str(row.get("liquipediatier") or "").strip()
-                    if tier in TIER_LABELS:
-                        return TIER_LABELS[tier]
             return None
 
         return await self._cache.get_or_set(f"tier:{name.lower()}", factory, ttl_sec=settings.cache_ttl_liquipedia_sec)

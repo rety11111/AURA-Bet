@@ -191,8 +191,10 @@ LIQUIPEDIA_USER_AGENT=BetSignalsBot/1.0 (contact: your@email.com)
 специально отключается (в коде это предусмотрено, чтобы вы не получили
 «тихо нерабочий» источник).
 
-Ключ `LIQUIPEDIA_API_KEY` — необязателен (поднимает лимиты, берётся на
-https://liquipedia.net/api), но требует подтверждения заявки.
+Ключ `LIQUIPEDIA_API_KEY` обязателен для LPDB v3: доступ выдаётся после заявки на
+https://liquipedia.net/api. Укажите `LIQUIPEDIA_API_URL=https://api.liquipedia.net/api/v3`
+(без `/query`; старый URL автоматически нормализуется). Без ключа источник отключён,
+остальные источники продолжат работу.
 
 ---
 
@@ -582,10 +584,12 @@ python scripts/check_sources.py --db   # источники + состояние
 **для каждого** из API-Football / API-Basketball / API-Tennis) или исчерпали
 бесплатную квоту на сутки. Проверьте `python scripts/check_sources.py`.
 
-**Liquipedia 403 или «провайдер отключён»**
+**Liquipedia 404, 403 или «провайдер отключён»**
 `LIQUIPEDIA_USER_AGENT` должен содержать реальный контакт:
 `BetSignalsBot/1.0 (contact: your@email.com)`. Значение из примера
-(`you@example.com`) намеренно блокируется кодом.
+(`you@example.com`) намеренно блокируется кодом. Для LPDB v3 также требуется
+`LIQUIPEDIA_API_KEY`; маршрут `/api/v3/query` не существует. После исправления
+переменных Railway перезапустите сервис.
 
 **Understat вернул 0 команд**
 У них менялась вёрстка/ключ в `window.__INITIAL_STATE__`. Откройте
