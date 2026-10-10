@@ -16,10 +16,38 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from loguru import logger
 
 from app.bot.handlers import AntifloodMiddleware, router
 from app.config import settings
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Устанавливает официальное меню команд Telegram (кнопка [/] в интерфейсе)."""
+    user_commands = [
+        BotCommand(command="start", description="🚀 Подписаться / перезапуск"),
+        BotCommand(command="stats", description="📊 Статистика: ROI и винрейт"),
+        BotCommand(command="signals", description="🎯 Последние сигналы"),
+        BotCommand(command="help", description="ℹ️ Справка и описание"),
+        BotCommand(command="stop", description="🔕 Отключить рассылку"),
+    ]
+    try:
+        await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+        for admin_id in settings.admin_ids:
+            admin_commands = user_commands + [
+                BotCommand(command="admin", description="⚙️ Панель администратора"),
+                BotCommand(command="costs", description="💰 Расходы и токены LLM"),
+                BotCommand(command="system", description="🔍 Статус сервиса"),
+                BotCommand(command="collect_now", description="🔄 Собрать матчи сейчас"),
+                BotCommand(command="analyze_now", description="⚡️ Запустить анализ сейчас"),
+            ]
+            try:
+                await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            except Exception as exc:
+                logger.debug("bot: set_my_commands для админа {} ({})", admin_id, exc)
+    except Exception as exc:
+        logger.warning("bot: не удалось зарегистрировать меню команд ({})", exc)
 
 
 def create_bot() -> Bot:

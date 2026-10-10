@@ -126,8 +126,23 @@ def edge(prob_final: float, prob_implied: float) -> float:
     return prob_final - prob_implied
 
 
-def kelly_stake_pct(prob_final: float, odds: float, fraction: float | None = None, cap: float | None = None) -> float:
-    """Дробный Келли в процентах банка, с жёстким кэпом и округлением до 0.25%."""
+def kelly_stake_pct(
+    prob_final: float,
+    odds: float,
+    fraction: float | None = None,
+    cap: float | None = None,
+    *,
+    adaptive: bool = True,
+    sport: str | None = None,
+    data_quality: str | None = None,
+) -> float:
+    """Дробный Келли в процентах банка, с жёстким кэпом и округлением до 0.25%.
+
+    Поддерживает адаптивную подстройку:
+      * Высокие кэфы (> 2.50) несут повышенную дисперсию → масштаб множителя 2.5 / odds (не ниже 0.5x);
+      * data_quality == 'partial' → снижение доли на 20% (защита от неполной статистики);
+      * esports (dota2, cs2) с высокой мета-волатильностью → умеренное демпфирование 0.85x.
+    """
     fraction = settings.kelly_fraction if fraction is None else fraction
     cap = settings.stake_cap_pct if cap is None else cap
     if odds <= 1.0 or prob_final <= 0:
@@ -135,12 +150,35 @@ def kelly_stake_pct(prob_final: float, odds: float, fraction: float | None = Non
     full_kelly = (prob_final * odds - 1.0) / (odds - 1.0)
     if full_kelly <= 0:
         return 0.0
-    stake = fraction * full_kelly * 100.0
+
+    adaptive_mult = 1.0
+    if adaptive:
+        if odds > 2.50:
+            adaptive_mult *= max(0.5, 2.5 / odds)
+        if data_quality in (DataQuality.WEAK, "weak", "partial"):
+            adaptive_mult *= 0.80
+        if sport in ("dota2", "cs2", "esports_dota2", "esports_cs2"):
+            adaptive_mult *= 0.85
+
+    stake = fraction * adaptive_mult * full_kelly * 100.0
     stake = min(stake, cap)
     step = settings.stake_round_step
     if step > 0:
         stake = math.floor(stake / step) * step
     return round(max(0.0, stake), 2)
+
+
+def calculate_clv(initial_odds: float, closing_odds: float) -> float:
+    """Расчет CLV (Closing Line Value) в процентах:
+
+    CLV = (initial_odds / closing_odds - 1.0) * 100%.
+    Положительный CLV означает, что ставка была сделана по более выгодной цене,
+    чем линия закрытия букмекера перед стартом матча (главный показатель качества модели).
+    """
+    if closing_odds <= 1.0 or initial_odds <= 1.0:
+        return 0.0
+    return round((initial_odds / closing_odds - 1.0) * 100.0, 2)
+
 
 
 def market_prices_for(outcome: AggregatedOutcome, outcomes: list[AggregatedOutcome]) -> list[float]:
@@ -298,10 +336,16 @@ def build_signal_payload(
     probabilities: MarketProbabilities,
     *,
     data_quality: str,
+    sport: str | None = None,
     is_live: bool = False,
 ) -> dict[str, Any]:
     """Готовит словарь для записи в signals."""
-    stake = kelly_stake_pct(candidate.prob_final, candidate.odds)
+    stake = kelly_stake_pct(
+        candidate.prob_final,
+        candidate.odds,
+        sport=sport,
+        data_quality=data_quality,
+    )
     reasoning = probabilities.reasoning or "; ".join(probabilities.key_factors[:3]) or "ансамбль модели и LLM"
     return {
         "market": candidate.market,

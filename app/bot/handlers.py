@@ -14,12 +14,21 @@
 
 from __future__ import annotations
 
+import html
 import time
 from collections import defaultdict, deque
 from typing import Any
 
 from aiogram import BaseMiddleware, F, Router
-from aiogram.types import Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    TelegramObject,
+)
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,9 +36,74 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.database import session_scope
 from app.db.models import Signal, SignalStatus, User
+from app.llm_client import format_llm_stats_text
 from app.tracking.results_tracker import performance_by_sport, performance_stats
 
 router = Router(name="betsignals")
+
+
+def is_admin_user(user_id: int | None) -> bool:
+    """Проверка, является ли пользователь администратором."""
+    if user_id is None:
+        return False
+    return user_id in settings.admin_ids
+
+
+def get_main_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    """Главная клавиатура бота: выбор команд нажатием кнопок вместо ручного ввода."""
+    rows = [
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🎯 Сигналы")],
+        [KeyboardButton(text="ℹ️ Справка")],
+    ]
+    if is_admin:
+        rows[1].append(KeyboardButton(text="⚙️ Админка"))
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def get_admin_inline_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-панель управления администратора."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💰 Расходы LLM", callback_data="admin_costs"),
+                InlineKeyboardButton(text="🔍 Статус системы", callback_data="admin_system"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Собрать расписание", callback_data="admin_collect_now"),
+                InlineKeyboardButton(text="⚡️ Запустить анализ", callback_data="admin_analyze_now"),
+            ],
+        ]
+    )
+
+
+async def system_status_text() -> str:
+    """Текстовая сводка состояния сервиса, БД и источников."""
+    from app.db.database import healthcheck
+    from app.pipeline.collector import get_providers
+    from app.sources.theoddsapi import TheOddsApiProvider
+
+    db_ok = await healthcheck()
+    providers = get_providers()
+    desc = providers.describe()
+
+    theodds_info = ""
+    theodds_prov = getattr(providers, "theoddsapi", None)
+    if isinstance(theodds_prov, TheOddsApiProvider):
+        quota = theodds_prov.quota_info()
+        theodds_info = f"\n   • TheOddsApi: использовано {quota['requests_used_local']}/{quota['monthly_limit']}"
+
+    return (
+        "🔍 <b>Статус системы BetSignals</b>\n\n"
+        f"• <b>БД PostgreSQL:</b> {'🟢 доступна' if db_ok else '🔴 НЕДОСТУПНА'}\n"
+        f"• <b>Часовой пояс:</b> {settings.tz}\n"
+        f"• <b>Источники кэфов:</b> {desc.get('odds', {})}{theodds_info}\n"
+        f"• <b>Источники статистики:</b> {desc.get('stats', {})}\n\n"
+        f"<b>LLM конфигурация:</b>\n"
+        f"• Скринер: <code>{settings.screener_model}</code>\n"
+        f"• Аналитик: <code>{settings.analyzer_model}</code>\n"
+        f"• Арбитр: <code>{settings.judge_model if settings.judge_enabled else 'выключен'}</code>"
+    )
+
 
 HELP_TEXT = (
     "<b>BetSignals</b> — сигналы value-ставок, отобранные связкой LLM + стат-моделей.\n\n"
@@ -207,7 +281,7 @@ async def stats_text(days: int = 30) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Команды
+# Команды и кнопки
 # --------------------------------------------------------------------------- #
 @router.message(F.text == "/start")
 @router.message(F.text.startswith("/start "))
@@ -217,15 +291,17 @@ async def cmd_start(message: Message) -> None:
     async with session_scope() as session:
         _user, is_new = await register_user(session, message.from_user.id, message.from_user.username)
     logger.info("bot: /start от {} (new={})", message.from_user.id, is_new)
+    is_admin = is_admin_user(message.from_user.id)
     text = (
         "👋 Добро пожаловать в <b>BetSignals</b>!\n\n"
         + ("Вы подписаны на сигналы. " if is_new else "Вы снова в списке рассылки. ")
         + "Сигналы будут приходить автоматически.\n\n"
         + f"Ваш Telegram ID: <code>{message.from_user.id}</code>\n"
-        + "(нужен для переменной TELEGRAM_ADMIN_IDS — см. SETUP.md)\n\n"
+        + ("(Вы авторизованы как ⭐️ <b>Администратор</b>)\n\n" if is_admin else "")
+        + "Для управления используйте кнопки внизу или меню команд [ / ]:\n\n"
         + HELP_TEXT
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=get_main_keyboard(is_admin))
 
 
 @router.message(F.text == "/stop")
@@ -234,30 +310,188 @@ async def cmd_stop(message: Message) -> None:
         return
     updated = await set_active(message.from_user.id, False)
     logger.info("bot: /stop от {} (found={})", message.from_user.id, updated)
+    is_admin = is_admin_user(message.from_user.id)
     await message.answer(
         "🔕 Рассылка выключена. Команда /start включит её снова.\n"
-        "Историю сигналов можно посмотреть командой /signals."
+        "Историю сигналов можно посмотреть командой /signals.",
+        reply_markup=get_main_keyboard(is_admin),
     )
 
 
-@router.message(F.text == "/signals")
+@router.message(F.text.in_({"🎯 Сигналы", "/signals"}))
 async def cmd_signals(message: Message) -> None:
+    is_admin = is_admin_user(message.from_user.id if message.from_user else None)
     async with session_scope() as session:
         text = await _recent_signals_text(session)
-    await message.answer(text)
+    await message.answer(text, reply_markup=get_main_keyboard(is_admin))
 
 
-@router.message(F.text == "/stats")
+@router.message(F.text.in_({"📊 Статистика", "/stats"}))
 async def cmd_stats(message: Message) -> None:
-    await message.answer(await stats_text(days=30))
+    is_admin = is_admin_user(message.from_user.id if message.from_user else None)
+    await message.answer(await stats_text(days=30), reply_markup=get_main_keyboard(is_admin))
 
 
-@router.message(F.text == "/help")
+@router.message(F.text.in_({"ℹ️ Справка", "/help"}))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    is_admin = is_admin_user(message.from_user.id if message.from_user else None)
+    text = HELP_TEXT
+    if is_admin:
+        text += (
+            "\n\n⚙️ <b>Команды администратора:</b>\n"
+            "/admin — панель управления\n"
+            "/costs — расходы и токены LLM\n"
+            "/system — статус источников и БД\n"
+            "/collect_now — принудительный сбор расписания\n"
+            "/analyze_now — запустить анализ матчей"
+        )
+    await message.answer(text, reply_markup=get_main_keyboard(is_admin))
+
+
+# --------------------------------------------------------------------------- #
+# Админ-функционал (только для TELEGRAM_ADMIN_IDS)
+# --------------------------------------------------------------------------- #
+@router.message(F.text.in_({"⚙️ Админка", "/admin"}))
+async def cmd_admin(message: Message) -> None:
+    if not is_admin_user(message.from_user.id if message.from_user else None):
+        await message.answer("⛔️ Доступ запрещён. Команда доступна только администраторам.")
+        return
+    await message.answer(
+        "⚙️ <b>Панель администратора BetSignals</b>\nВыберите действие кнопкой ниже:",
+        reply_markup=get_admin_inline_keyboard(),
+    )
+
+
+@router.message(F.text == "/costs")
+async def cmd_costs(message: Message) -> None:
+    if not is_admin_user(message.from_user.id if message.from_user else None):
+        await message.answer("⛔️ Доступ запрещён. Команда доступна только администраторам.")
+        return
+    await message.answer(format_llm_stats_text())
+
+
+@router.message(F.text == "/system")
+async def cmd_system(message: Message) -> None:
+    if not is_admin_user(message.from_user.id if message.from_user else None):
+        await message.answer("⛔️ Доступ запрещён. Команда доступна только администраторам.")
+        return
+    await message.answer(await system_status_text())
+
+
+async def _execute_collect(message: Message) -> None:
+    progress = await message.answer("⏳ <b>Запущен принудительный сбор расписания матчей...</b>")
+    try:
+        from app.scheduler import job_collect_schedule
+
+        result = await job_collect_schedule()
+        details = ", ".join(f"{k}: {v}" for k, v in result.items()) if result else "нет новых матчей"
+        await progress.edit_text(f"✅ <b>Сбор расписания завершён!</b>\nРезультат: <code>{details}</code>")
+    except Exception as exc:
+        logger.exception("admin: ошибка сбора расписания: {}", exc)
+        await progress.edit_text(f"❌ <b>Ошибка при сборе расписания:</b>\n<code>{html.escape(str(exc)[:300])}</code>")
+
+
+async def _execute_analyze(message: Message) -> None:
+    progress = await message.answer("⏳ <b>Запущен принудительный анализ матчей (PASS 1 & 2)...</b>")
+    try:
+        from app.scheduler import job_prematch_passes
+
+        result = await job_prematch_passes()
+        await progress.edit_text(f"✅ <b>Анализ завершён!</b>\nРезультат: <code>{result}</code>")
+    except Exception as exc:
+        logger.exception("admin: ошибка анализа: {}", exc)
+        await progress.edit_text(f"❌ <b>Ошибка при анализе:</b>\n<code>{html.escape(str(exc)[:300])}</code>")
+
+
+@router.message(F.text == "/collect_now")
+async def cmd_collect_now(message: Message) -> None:
+    if not is_admin_user(message.from_user.id if message.from_user else None):
+        await message.answer("⛔️ Доступ запрещён. Команда доступна только администраторам.")
+        return
+    await _execute_collect(message)
+
+
+@router.message(F.text == "/analyze_now")
+async def cmd_analyze_now(message: Message) -> None:
+    if not is_admin_user(message.from_user.id if message.from_user else None):
+        await message.answer("⛔️ Доступ запрещён. Команда доступна только администраторам.")
+        return
+    await _execute_analyze(message)
+
+
+# --------------------------------------------------------------------------- #
+# Инлайн-кнопки админки
+# --------------------------------------------------------------------------- #
+@router.callback_query(F.data == "admin_menu")
+async def callback_admin_menu(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён", show_alert=True)
+        return
+    if callback.message and isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "⚙️ <b>Панель администратора BetSignals</b>\nВыберите действие кнопкой ниже:",
+            reply_markup=get_admin_inline_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_costs")
+async def callback_admin_costs(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_costs")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="admin_menu")],
+        ]
+    )
+    if callback.message and isinstance(callback.message, Message):
+        await callback.message.edit_text(format_llm_stats_text(), reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_system")
+async def callback_admin_system(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_system")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="admin_menu")],
+        ]
+    )
+    if callback.message and isinstance(callback.message, Message):
+        await callback.message.edit_text(await system_status_text(), reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_collect_now")
+async def callback_admin_collect_now(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён", show_alert=True)
+        return
+    await callback.answer("Запускаю сбор расписания...")
+    if callback.message and isinstance(callback.message, Message):
+        await _execute_collect(callback.message)
+
+
+@router.callback_query(F.data == "admin_analyze_now")
+async def callback_admin_analyze_now(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён", show_alert=True)
+        return
+    await callback.answer("Запускаю анализ...")
+    if callback.message and isinstance(callback.message, Message):
+        await _execute_analyze(callback.message)
 
 
 @router.message()
 async def fallback(message: Message) -> None:
     """Любой другой текст — короткая подсказка (бот не «разговаривает»: LLM занят анализом)."""
-    await message.answer("Я понимаю только команды. Наберите /help — там список.")
+    is_admin = is_admin_user(message.from_user.id if message.from_user else None)
+    await message.answer(
+        "Я понимаю только команды. Нажмите кнопку внизу или выберите команду из меню [ / ].",
+        reply_markup=get_main_keyboard(is_admin),
+    )

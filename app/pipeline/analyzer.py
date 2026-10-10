@@ -490,7 +490,14 @@ async def analyze_match(
     # --------------------------------------------- запись + арбитр + статус
     confirmed = rejected = 0
     for candidate, score in selected:
-        payload = build_signal_payload(candidate, score, probabilities, data_quality=data_quality, is_live=is_live)
+        payload = build_signal_payload(
+            candidate,
+            score,
+            probabilities,
+            data_quality=data_quality,
+            sport=match.sport.code if getattr(match, "sport", None) else None,
+            is_live=is_live,
+        )
         signal = Signal(
             match_id=match.id,
             market=payload["market"],

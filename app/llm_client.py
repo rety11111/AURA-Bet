@@ -71,7 +71,35 @@ def extract_json(text: str) -> dict[str, Any]:
     raise LLMError("в ответе модели нет JSON-объекта")
 
 
+# Примерная стоимость за 1 миллион токенов (prompt_cost, completion_cost) в USD на OpenRouter
+MODEL_PRICING_PER_M: dict[str, tuple[float, float]] = {
+    "anthropic/claude-3.5-sonnet": (3.00, 15.00),
+    "anthropic/claude-3-haiku": (0.25, 1.25),
+    "deepseek/deepseek-chat": (0.14, 0.28),
+    "deepseek/deepseek-r1": (0.55, 2.19),
+    "qwen/qwen-2.5-72b": (0.35, 0.40),
+    "meta-llama/llama-3.1-70b": (0.35, 0.40),
+    "meta-llama/llama-3.1-8b": (0.06, 0.06),
+    "google/gemini-flash": (0.075, 0.30),
+}
+
+
+def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Оценка расхода в USD по известным тарифам OpenRouter."""
+    pricing = None
+    model_lower = model.lower()
+    for key, val in MODEL_PRICING_PER_M.items():
+        if key in model_lower:
+            pricing = val
+            break
+    if pricing is None:
+        pricing = (0.50, 1.50)  # разумный дефолт
+    prompt_rate, completion_rate = pricing
+    return (prompt_tokens / 1_000_000.0) * prompt_rate + (completion_tokens / 1_000_000.0) * completion_rate
+
+
 class OpenRouterClient:
+
     """Тонкая обёртка над OpenAI SDK с ретраями, семафором и валидацией pydantic."""
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
@@ -296,14 +324,58 @@ class OpenRouterClient:
                 raise LLMError(f"{label}: повторный ответ тоже невалиден: {exc2}") from exc2
 
     def usage_summary(self) -> dict[str, Any]:
+        total_cost = 0.0
+        by_model_summary: dict[str, Any] = {}
+        for model_name, info in self.stats["by_model"].items():
+            cost = estimate_cost_usd(model_name, info.get("prompt_tokens", 0), info.get("completion_tokens", 0))
+            total_cost += cost
+            by_model_summary[model_name] = {
+                **info,
+                "estimated_cost_usd": round(cost, 4),
+            }
         return {
             "requests": self.stats["requests"],
             "failures": self.stats["failures"],
             "invalid_json": self.stats["invalid_json"],
             "prompt_tokens": self.stats["prompt_tokens"],
             "completion_tokens": self.stats["completion_tokens"],
-            "by_model": self.stats["by_model"],
+            "total_tokens": self.stats["prompt_tokens"] + self.stats["completion_tokens"],
+            "estimated_cost_usd": round(total_cost, 4),
+            "by_model": by_model_summary,
         }
+
+
+def format_llm_stats_text(client: OpenRouterClient | None = None) -> str:
+    """Форматирует красивый отчёт по использованию LLM для админки в Telegram."""
+    cli = client or get_llm_client()
+    summary = cli.usage_summary()
+
+    lines = [
+        "💰 <b>Мониторинг расходов и токенов LLM</b>\n",
+        f"• <b>Всего запросов:</b> {summary['requests']} (ошибок: {summary['failures']}, испр. JSON: {summary['invalid_json']})",
+        f"• <b>Токены:</b> {summary['total_tokens']:,} (вход: {summary['prompt_tokens']:,} | выход: {summary['completion_tokens']:,})",
+        f"• <b>Оценка стоимости:</b> ~${summary['estimated_cost_usd']:.4f} USD\n",
+    ]
+
+    by_model = summary.get("by_model", {})
+    if by_model:
+        lines.append("<b>Расход по моделям:</b>")
+        for m_name, m_info in by_model.items():
+            lines.append(
+                f"▫️ <code>{m_name}</code>:\n"
+                f"   {m_info['calls']} выз. | {m_info['prompt_tokens'] + m_info['completion_tokens']:,} tok "
+                f"(~${m_info['estimated_cost_usd']:.4f})"
+            )
+    else:
+        lines.append("<i>Запросов к LLM в этой сессии ещё не было.</i>")
+
+    lines.append(
+        f"\n⚙️ <b>Текущие модели:</b>\n"
+        f"• Скринер: <code>{settings.screener_model}</code>\n"
+        f"• Аналитик: <code>{settings.analyzer_model}</code>\n"
+        f"• Арбитр: <code>{settings.judge_model if settings.judge_enabled else 'выключен'}</code>"
+    )
+    return "\n".join(lines)
 
 
 _client: OpenRouterClient | None = None
