@@ -763,11 +763,20 @@ async def _context_stats(
             for injury in (await providers.mma.get_injuries(home_name))[:4]
         ]
     elif sport_code in ("dota2", "cs2"):
-        out["esports"] = {
-            "tier": await providers.liquipedia.get_tournament_tier(match.league),
-            "roster_home": await providers.liquipedia.get_team_roster(sport_code, home_name),
-            "roster_away": await providers.liquipedia.get_team_roster(sport_code, away_name),
-        }
+        liquipedia = getattr(providers, "liquipedia", None)
+        if liquipedia and liquipedia.available:
+            esports: dict[str, Any] = {}
+            for key, call in (
+                ("tier", lambda: liquipedia.get_tournament_tier(match.league)),
+                ("roster_home", lambda: liquipedia.get_team_roster(sport_code, home_name)),
+                ("roster_away", lambda: liquipedia.get_team_roster(sport_code, away_name)),
+            ):
+                try:
+                    esports[key] = await call()
+                except Exception as exc:  # noqa: BLE001 — 404 / открытый Circuit Breaker не валят анализ
+                    logger.warning("analyzer: Liquipedia {} недоступна для match_id={}: {}", key, match.id, exc)
+                    esports[key] = None
+            out["esports"] = esports
     return out
 
 
@@ -836,18 +845,26 @@ async def run_prematch_pass(session: AsyncSession, pass_no: int, providers: Any 
     return stats
 
 
-async def reject_stale_candidates(session: AsyncSession, match_ids: list[int]) -> int:
-    """Закрывает кандидатов PASS 1, которые не подтвердились на PASS 2."""
-    if not match_ids:
+# Матч, стартующий в пределах этого окна, уже не успеет пройти PASS 2 — кандидат устарел.
+STALE_CUTOFF_MINUTES = 5
+
+
+async def reject_stale_candidates(session: AsyncSession, match_ids: list[int] | None = None) -> int:
+    """Закрывает устаревших кандидатов.
+
+    • match_ids передан — кандидаты PASS 1 этих матчей, не подтвердившиеся на PASS 2;
+    • match_ids is None — все CANDIDATE, чей матч уже начался или стартует в ближайшие
+      STALE_CUTOFF_MINUTES (Match.starts_at <= cutoff).
+    """
+    query = select(Signal).where(Signal.status == SignalStatus.CANDIDATE)
+    if match_ids is None:
+        cutoff = _now() + timedelta(minutes=STALE_CUTOFF_MINUTES)
+        query = query.join(Match, Match.id == Signal.match_id).where(Match.starts_at <= cutoff)
+    elif not match_ids:
         return 0
-    rows = (
-        await session.execute(
-            select(Signal).where(
-                Signal.match_id.in_(match_ids),
-                Signal.status == SignalStatus.CANDIDATE,
-            )
-        )
-    ).scalars().all()
+    else:
+        query = query.where(Signal.match_id.in_(match_ids))
+    rows = (await session.execute(query)).scalars().all()
     for signal in rows:
         signal.status = SignalStatus.REJECTED
         signal.judge_reason = "PASS 2: edge не подтверждён свежими данными (составы/линия изменились)"
