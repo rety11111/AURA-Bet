@@ -196,7 +196,7 @@ async def _handle_dota_match(
 # CS2
 # --------------------------------------------------------------------------- #
 async def _process_cs2(session: AsyncSession, providers: Providers, stats: dict[str, Any]) -> int:
-    """CS2: лайв-события и кэфы берём из Winline; карта — из Liquipedia/данных события."""
+    """CS2: лайв-события и кэфы берём из Winline; карта — из Cito/Liquipedia/данных события."""
     events: list[SourceMatch] = []
     for provider in providers.odds:
         if not getattr(provider, "available", False) or not getattr(provider, "live_available", False):
@@ -361,16 +361,27 @@ async def _ensure_match(
 
 
 async def _is_tier1(providers: Providers, sport: str, league: str) -> bool:
-    """Только tier-1 (S-Tier/Tier 1) — по Liquipedia, с кэшем внутри провайдера."""
+    """Только tier-1 (S-Tier/Tier 1) — Cito, затем Liquipedia; кэш внутри провайдеров."""
     if not league or league == "unknown":
         return False
     low = league.lower()
     if any(keyword in low for keyword in ("the international", "major", "esl one", "esl pro league", "blast premier", "iem", "riyadh")):
         return True
-    tier = await providers.liquipedia.get_tournament_tier(league)
-    if tier is None:
-        return False
-    return any(allowed in tier.lower() for allowed in settings.allowed_esports_tiers)
+    # Cito — основной источник tier (Liquipedia выключается по ключу/ToS), порядок —
+    # как в Providers.stats_for: сначала cito, потом liquipedia.
+    for esports in (getattr(providers, "cito", None), getattr(providers, "liquipedia", None)):
+        if esports is None or not esports.available:
+            continue
+        try:
+            tier = await esports.get_tournament_tier(league, sport=sport)
+        except Exception as exc:  # noqa: BLE001 — tier не должен валить лайв-тик
+            logger.debug("live_worker: {} не отдал tier для '{}': {}", esports.provider_name, league, exc)
+            continue
+        if tier is None:
+            continue
+        if any(allowed in tier.lower() for allowed in settings.allowed_esports_tiers):
+            return True
+    return False
 
 
 def _favourite_odds(outcomes: list[Any]) -> float | None:
@@ -417,15 +428,25 @@ def _str_from(raw: dict[str, Any], keys: tuple[str, ...]) -> str | None:
 async def _map_h2h(
     session: AsyncSession, providers: Providers, match_row: Match, map_name: str | None
 ) -> dict[str, Any] | None:
-    """Win-rate обеих команд на карте (Liquipedia) — контекст для окна 1 в CS2."""
+    """Win-rate обеих команд на карте (Cito → Liquipedia) — контекст для окна 1 в CS2."""
     if not map_name:
         return None
     home_name = await _team_name(session, match_row.home_team_id)
     away_name = await _team_name(session, match_row.away_team_id)
     if not home_name or not away_name:
         return None
-    home_stats = await providers.liquipedia.get_map_stats(home_name, map_name)
-    away_stats = await providers.liquipedia.get_map_stats(away_name, map_name)
+    home_stats, away_stats = None, None
+    for esports in (getattr(providers, "cito", None), getattr(providers, "liquipedia", None)):
+        if esports is None or not esports.available:
+            continue
+        try:
+            home_stats = await esports.get_map_stats(home_name, map_name)
+            away_stats = await esports.get_map_stats(away_name, map_name)
+        except Exception as exc:  # noqa: BLE001 — контекст карты не критичен для сигнала
+            logger.debug("live_worker: {} не отдал статистику карты: {}", esports.provider_name, exc)
+            continue
+        if home_stats is not None or away_stats is not None:
+            break
     if home_stats is None and away_stats is None:
         return None
     return {

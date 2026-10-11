@@ -258,13 +258,67 @@ async def probe_liquipedia(ctx: ProbeContext) -> str:
         return "провайдер не создан"
     if not provider.available:
         return (
-            "❌ Недоступен: задайте LIQUIPEDIA_USER_AGENT в формате "
-            '«BetSignalsBot/1.0 (contact: your@email)» — см. SETUP.md'
+            "❌ Недоступен: LPDB v3 требует ключ LIQUIPEDIA_API_KEY (https://liquipedia.net/api) "
+            "и User-Agent с контактом; причина — "
+            f"{provider.disabled_reason or 'ключ/UA не заданы'} — см. SETUP.md §4.4"
         )
     matches = await provider.get_upcoming_matches("cs2", days=3)
     lines = [f"API: {provider.base_url}", f"матчей CS2 на 3 дня: {len(matches)}"]
     tier = await provider.get_tournament_tier("BLAST Premier World Final")
     lines.append(f"tier «BLAST Premier World Final»: {tier or 'не определён'}")
+    return "\n".join(lines)
+
+
+async def probe_cito(ctx: ProbeContext) -> str:
+    """Cito API — замена Liquipedia для CS2/Dota 2 (free-план 500 запросов/мес)."""
+    provider = ctx.providers.cito
+    if provider is None:
+        return "провайдер не создан"
+    if not provider.available:
+        return (
+            "❌ Недоступен: Cito требует CITO_API_KEY (бесплатный ключ на https://citoapi.com); "
+            f"причина — {provider.disabled_reason or 'ключ не задан'}"
+        )
+    lines = [f"API: {provider.base_url}"]
+    for sport in ("cs2", "dota2"):
+        matches = await provider.get_upcoming_matches(sport, days=3)
+        lines.append(f"матчей {sport} на 3 дня: {len(matches)}")
+        if matches:
+            first = matches[0]
+            lines.append(
+                f"пример: {first.home_team} — {first.away_team} | {first.league} | "
+                f"tier {first.league_tier or '—'} | {first.starts_at:%Y-%m-%d %H:%M UTC}"
+            )
+    tier = await provider.get_tournament_tier("BLAST Premier World Final", sport="cs2")
+    lines.append(f"tier «BLAST Premier World Final»: {tier or 'не определён'}")
+    lines.append(
+        f"остаток месячного бюджета: {provider.budget_remaining} из CITO_MONTHLY_LIMIT "
+        f"(лайв-опрос {'включён' if settings.cito_live_enabled else 'выключен'})"
+    )
+    return "\n".join(lines)
+
+
+async def probe_onexbet(ctx: ProbeContext) -> str:
+    """1xBet (RapidAPI) — кэфы, включая киберспорт; free-план 500 запросов/мес."""
+    provider = next(
+        (item for item in ctx.providers.odds if getattr(item, "provider_name", "") == "1xbet"), None
+    )
+    if provider is None:
+        return "провайдер не создан"
+    if not provider.available:
+        return (
+            "❌ Недоступен: нужны ONEXBET_ENABLED=true, RAPIDAPI_KEY и подписка Basic на "
+            "1xBet API в RapidAPI; хост сверьте в Playground "
+            f"(ONEXBET_RAPIDAPI_HOST); причина — {provider.disabled_reason or 'выключен'}"
+        )
+    sports = await provider._sport_id("cs2")
+    lines = [
+        f"хост: {provider.host}",
+        f"спорт-ключи cs2: {sports if sports is not None else 'не найден — задайте ONEXBET_SPORT_IDS'}",
+        f"остаток месячного бюджета: {provider.budget_remaining} из ONEXBET_MONTHLY_LIMIT",
+    ]
+    matches = await provider.get_upcoming("dota2", datetime.now(timezone.utc).date())
+    lines.append(f"прематч dota2 на сегодня: {len(matches)}")
     return "\n".join(lines)
 
 
@@ -279,6 +333,8 @@ PROBES: dict[str, Probe] = {
     "mma_rss": probe_mma_rss,
     "opendota": probe_opendota,
     "liquipedia": probe_liquipedia,
+    "cito": probe_cito,
+    "onexbet": probe_onexbet,
 }
 
 

@@ -4,11 +4,15 @@
 Поэтому:
   * провайдер по умолчанию ВЫКЛЮЧЕН (THE_ODDS_API_ENABLED=false) и НЕ используется
     для регулярного поллинга;
-  * все ответы кэшируются (TTL 15 минут для линий, 6 часов для списка спортов);
+  * все ответы кэшируются (TTL 15 минут для линий), «не нашёл событие» тоже кэшируется,
+    а спорт-ключи, которых у API нет, вообще не запрашиваются (иначе — 404 UNKNOWN_SPORT
+    и сожжённый запрос);
   * перед каждым запросом проверяется внутренний счётчик (THE_ODDS_API_MONTHLY_LIMIT,
     дефолт 450 — держим запас к 500). Счётчик живёт в памяти процесса: после рестарта
-    он обнуляется, но лимит 450 всё равно даёт небольшой запас. Актуальный расход
-    всегда виден в заголовках x-requests-remaining / x-requests-used — они пишутся в лог.
+    он обнуляется, зато перезапуск не отменяет главного — реального расхода;
+  * при ответе OUT_OF_USAGE_CREDITS (HTTP 401) или `x-requests-remaining: 0` провайдер
+    уходит на паузу THE_ODDS_API_QUOTA_COOLDOWN_HOURS (дефолт 12 ч). Раньше он продолжал
+    стучаться каждую минуту через circuit breaker — это чистый спам в логах и в лимитах.
 
 Документация API: https://the-odds-api.com/liveapi/guides/v4/
 Спорт-ключи (soccer, icehockey_nhl, basketball_nba, ...) — официальные значения
@@ -17,7 +21,7 @@ API; полный список: GET /v4/sports/?apiKey=... (см. scripts/check_
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger
@@ -35,6 +39,11 @@ _MARKET_MAP = {
 
 class TheOddsApiProvider(OddsProvider):
     provider_name = "theoddsapi"
+    # Только спорты с официальными спорт-ключами API. Раньше collector вызывал
+    # get_upcoming() по всем видам спорта (включая boxing/dota2/cs2), и мы получали
+    # 404 UNKNOWN_SPORT — запрос в пустоту, который ещё и размыкал circuit breaker.
+    supported_sports: tuple[str, ...] = tuple(THE_ODDS_API_SPORT_KEYS)
+    _QUOTA_MARKERS = ("out_of_usage_credits", "usage quota", "quota has been reached")
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None, **kwargs: Any) -> None:
         super().__init__(source_name=self.provider_name, **kwargs)
@@ -44,16 +53,42 @@ class TheOddsApiProvider(OddsProvider):
         self._requests_used = 0
         self._events_by_id: dict[str, str] = {}  # event_id → sport key
         self._log_usage_headers: dict[str, str] = {}
+        self._quota_exhausted_until: datetime | None = None
 
     @property
     def available(self) -> bool:
-        return bool(self.api_key) and settings.the_odds_api_enabled
+        return bool(self.api_key) and settings.the_odds_api_enabled and not self.quota_exhausted
 
     # ------------------------------------------------------------------ quota
+    @property
+    def quota_exhausted(self) -> bool:
+        """True, пока действует пауза после ответа «месячный лимит исчерпан»."""
+        if self._quota_exhausted_until is None:
+            return False
+        if datetime.now(timezone.utc) >= self._quota_exhausted_until:
+            self._quota_exhausted_until = None
+            logger.info("{}: пауза по лимиту истекла — пробуем обратиться к API снова", self.provider_name)
+            return False
+        return True
+
+    def _mark_quota_exhausted(self, reason: str) -> None:
+        if self._quota_exhausted_until is not None:
+            return
+        until = datetime.now(timezone.utc) + timedelta(hours=settings.the_odds_api_quota_cooldown_hours)
+        self._quota_exhausted_until = until
+        logger.warning(
+            "{}: лимит free-тарифа исчерпан ({}). Запросы не отправляем до {} UTC — "
+            "лимит у the-odds-api месячный, «пробовать каждую минуту» бессмысленно "
+            "(пауза настраивается THE_ODDS_API_QUOTA_COOLDOWN_HOURS)",
+            self.provider_name, reason, until.strftime("%Y-%m-%d %H:%M"),
+        )
+
     def _can_spend(self, n: int = 1) -> bool:
+        if self.quota_exhausted:
+            return False
         if self._requests_used + n > settings.the_odds_api_monthly_limit:
             logger.warning(
-                "{}: месячный лимит {} запросов исчерпан (использовано {}) — пропускаем вызов",
+                "{}: локальный предохранитель {} запросов исчерпан (использовано {}) — пропускаем вызов",
                 self.provider_name, settings.the_odds_api_monthly_limit, self._requests_used,
             )
             return False
@@ -61,22 +96,31 @@ class TheOddsApiProvider(OddsProvider):
 
     async def _get(self, path: str, params: dict[str, Any]) -> Any:
         if not self.available:
+            if self.quota_exhausted:
+                raise SourceError(f"{self.provider_name}: лимит free-тарифа исчерпан — источник на паузе")
             raise SourceError(f"{self.provider_name}: недоступен (нет ключа или THE_ODDS_API_ENABLED=false)")
         if not self._can_spend():
             raise SourceError(f"{self.provider_name}: исчерпан месячный лимит бесплатного тарифа")
         params = {**params, "apiKey": self.api_key}
-        # httpx возвращает заголовки после запроса — читаем их в request/response
-        response = await self.request("GET", f"{self.base_url}{path}", params=params)
+        try:
+            response = await self.request("GET", f"{self.base_url}{path}", params=params)
+        except SourceError as exc:
+            message = str(exc).lower()
+            if any(marker in message for marker in self._QUOTA_MARKERS):
+                self._mark_quota_exhausted("HTTP 401 OUT_OF_USAGE_CREDITS")
+            raise
         self._requests_used += 1
         for header in ("x-requests-remaining", "x-requests-used", "x-requests-last"):
             value = response.headers.get(header)
             if value is not None:
                 self._log_usage_headers[header] = value
+        remaining = (response.headers.get("x-requests-remaining") or "").strip()
         logger.info(
-            "{}: GET {} (использовано {} из {}; осталось: {})",
-            self.provider_name, path, self._requests_used,
-            settings.the_odds_api_monthly_limit, self._log_usage_headers.get("x-requests-remaining", "?"),
+            "{}: GET {} (запросов за сессию: {}; остаток по заголовкам: {})",
+            self.provider_name, path, self._requests_used, remaining or "?",
         )
+        if remaining == "0":
+            self._mark_quota_exhausted("x-requests-remaining: 0")
         try:
             return response.json()
         except ValueError as exc:
@@ -86,11 +130,20 @@ class TheOddsApiProvider(OddsProvider):
         return {
             "requests_used_local": self._requests_used,
             "monthly_limit": settings.the_odds_api_monthly_limit,
+            "quota_exhausted_until": (
+                self._quota_exhausted_until.isoformat() if self._quota_exhausted_until is not None else None
+            ),
             "headers": dict(self._log_usage_headers),
         }
 
     # ------------------------------------------------------------------ match
     async def get_upcoming(self, sport: str, day: date) -> list[Match]:
+        if sport not in self.supported_sports:
+            logger.debug(
+                "{}: спорт '{}' не поддерживается API — пропускаем без запроса",
+                self.provider_name, sport,
+            )
+            return []
         sport_key = THE_ODDS_API_SPORT_KEYS.get(sport, sport)
         cache_key = f"upcoming:{sport_key}:{day.isoformat()}"
 
@@ -115,10 +168,9 @@ class TheOddsApiProvider(OddsProvider):
                     start_dt = datetime.fromisoformat(str(starts_at).replace("Z", "+00:00")).astimezone(timezone.utc)
                 except (TypeError, ValueError):
                     continue
-                if start_dt.date() not in (day, day.replace(day=day.day)) and start_dt.date() != day:
+                if start_dt.date() != day:
                     # The Odds API отдаёт всё, что знает; фильтруем по дате локально.
-                    if start_dt.date() != day:
-                        continue
+                    continue
                 event_id = str(event.get("id"))
                 self._events_by_id[event_id] = sport_key
                 matches.append(
@@ -195,26 +247,46 @@ class TheOddsApiProvider(OddsProvider):
             return "away_handicap" if market_type == "handicap" else "away"
         return None
 
+    async def _events_for_sport(self, sport_key: str) -> list[dict[str, Any]]:
+        """События спорта (кэш 15 минут) + заполнение карты event_id → sport_key."""
+        async def factory() -> list[dict[str, Any]]:
+            payload = await self._get(
+                f"/sports/{sport_key}/odds",
+                {"regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
+            )
+            if not isinstance(payload, list):
+                raise SourceError(f"{self.provider_name}: неожиданный формат ответа ({type(payload).__name__})")
+            events = [event for event in payload if isinstance(event, dict)]
+            for event in events:
+                if event.get("id") is not None:
+                    self._events_by_id[str(event["id"])] = sport_key
+            return events
+
+        return await self._cache.get_or_set(f"events:{sport_key}", factory)
+
+    async def _resolve_sport_key(self, match_id: str) -> str | None:
+        """Ищет спорт-ключ события: сначала в памяти, потом сканом известных спортов.
+
+        И «не нашли» тоже кэшируется — иначе каждый проход снова жёг бы до 5 запросов
+        (именно так и выгорал free-tier).
+        """
+        cached = self._events_by_id.get(str(match_id))
+        if cached:
+            return cached
+        if self.quota_exhausted or self._cache.get(f"unknown:{match_id}"):
+            return None
+        for sport_key in dict.fromkeys(THE_ODDS_API_SPORT_KEYS.values()):
+            try:
+                events = await self._events_for_sport(sport_key)
+            except SourceError:
+                continue
+            if any(str(event.get("id")) == str(match_id) for event in events):
+                return sport_key
+        self._cache.set(f"unknown:{match_id}", True)
+        return None
+
     async def get_odds(self, match_id: str) -> list[Odd]:
-        sport_key = self._events_by_id.get(str(match_id))
-        if not sport_key:
-            # Пытаемся найти спорт-ключ по всем известным (стоит запросов — кэшируем).
-            for candidate in set(THE_ODDS_API_SPORT_KEYS.values()):
-                try:
-                    events = await self._get(
-                        f"/sports/{candidate}/odds",
-                        {"regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
-                    )
-                except SourceError:
-                    continue
-                if isinstance(events, list):
-                    for event in events:
-                        if isinstance(event, dict) and str(event.get("id")) == str(match_id):
-                            sport_key = candidate
-                            self._events_by_id[str(match_id)] = candidate
-                            break
-                if sport_key:
-                    break
+        sport_key = await self._resolve_sport_key(match_id)
         if not sport_key:
             raise SourceError(f"{self.provider_name}: спорт-ключ для события {match_id} не найден")
 

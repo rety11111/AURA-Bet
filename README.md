@@ -104,7 +104,9 @@ python -m app.main                 # запуск: бот + планировщи
 │   │   ├── apitennis.py         # теннис (пути эндпоинтов подбираются, см. честную пометку в файле)
 │   │   ├── mma_rss.py           # MMA/боксинг: RSS + LLM (без выдуманных статструктур)
 │   │   ├── opendota.py          # Dota 2: лайв-матчи, драфт, статистика карт
-│   │   ├── liquipedia.py        # CS2/Dota турниры и tier (нужен User-Agent с контактом)
+│   │   ├── cito.py              # CS2/Dota 2: расписание, tier, карты, ростеры (free 500/мес)
+│   │   ├── onexbet.py           # 1xBet (RapidAPI): кэфы, включая киберспорт (free 500/мес)
+│   │   ├── liquipedia.py        # CS2/Dota турниры и tier — фолбэк (LPDB v3, ключ вручную)
 │   │   ├── team_matching.py     # алиасы + транслитерация + rapidfuzz (порог 85)
 │   │   └── odds_aggregator.py   # медиана implied, лучшая цена, флаг suspicious, снимки
 │   ├── stats_models/
@@ -162,8 +164,10 @@ python -m app.main                 # запуск: бот + планировщи
 | balldontlie | баскетбол-фолбэк | ключ по желанию |
 | API-Tennis | матчи, форма, H2H | RapidAPI-ключ + Free Subscribe |
 | MMA RSS (Чемпионат/Спортс) | новости MMA/боксинга → LLM | ничего (можно заменить `RSS_FEEDS`) |
+| **Cito API** | CS2/Dota 2: расписание, tier, винрейт по картам, ростеры | `CITO_API_KEY` (бесплатно, 500 запросов/мес) |
+| 1xBet API (RapidAPI) | Кэфы прематч/лайв, включая CS2/Dota 2 | `ONEXBET_ENABLED=true` + подписка Basic в RapidAPI (500 запросов/мес) |
 | OpenDota | Dota 2: лайв, драфт, карты | ничего |
-| Liquipedia | CS2/Dota турниры и tier | `LIQUIPEDIA_USER_AGENT` с реальной почтой |
+| Liquipedia (фолбэк) | CS2/Dota турниры и tier | `LIQUIPEDIA_API_KEY` (LPDB v3, ключ вручную; free-tier запрещает ставки) |
 
 Отказ любого источника изолирован: он логируется, а данные помечаются
 `data_quality="weak"` — сигнал по такому матчу не отправляется. Ни одна ошибка сети

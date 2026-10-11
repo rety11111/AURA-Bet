@@ -29,13 +29,15 @@ from app.db.models import DataQuality, Match as MatchRow, MatchStatus, Sport
 from app.sources.apibasketball import ApiBasketballProvider, BallDontLieProvider
 from app.sources.apifootball import ApiFootballProvider
 from app.sources.apitennis import ApiTennisProvider
-from app.sources.base import Match, OddsProvider, SourceError, StatsProvider
+from app.sources.base import EsportsLiveMatch, Match, OddsProvider, SourceError, StatsProvider
 from app.sources.betboom import BetBoomOddsProvider
+from app.sources.cito import CitoEsportsProvider
 from app.sources.liquipedia import LiquipediaProvider
 from app.sources.mma_rss import MmaRssProvider
 from app.sources.moneypuck import MoneyPuckProvider
 from app.sources.nhl import NhlProvider
 from app.sources.odds_aggregator import OddsAggregator
+from app.sources.onexbet import OnexbetOddsProvider
 from app.sources.opendota import OpenDotaProvider
 from app.sources.team_matching import TeamMatcher
 from app.sources.theoddsapi import TheOddsApiProvider
@@ -66,6 +68,7 @@ class Providers:
     fight_news: MmaRssProvider | None = None
     opendota: OpenDotaProvider | None = None
     liquipedia: LiquipediaProvider | None = None
+    cito: CitoEsportsProvider | None = None
 
     def stats_for(self, sport: str) -> list[StatsProvider]:
         """Статистические источники sport'а в порядке приоритета."""
@@ -76,8 +79,8 @@ class Providers:
             "tennis": [self.tennis],
             "mma": [self.fight_news],
             "boxing": [self.fight_news],
-            "dota2": [self.opendota, self.liquipedia],
-            "cs2": [self.liquipedia],
+            "dota2": [self.opendota, self.cito, self.liquipedia],
+            "cs2": [self.cito, self.liquipedia],
         }
         return [source for source in mapping.get(sport, []) if source is not None]
 
@@ -99,6 +102,7 @@ class Providers:
                 "mma-rss": bool(self.fight_news and self.fight_news.available),
                 "opendota": bool(self.opendota and self.opendota.available),
                 "liquipedia": bool(self.liquipedia and self.liquipedia.available),
+                "cito": bool(self.cito and self.cito.available),
             },
         }
 
@@ -108,6 +112,7 @@ def build_providers() -> Providers:
     winline = WinlineOddsProvider()
     betboom = BetBoomOddsProvider()
     theoddsapi = TheOddsApiProvider()
+    onexbet = OnexbetOddsProvider()
     odds: list[OddsProvider] = [winline, betboom]
     if settings.the_odds_api_enabled:
         odds.append(theoddsapi)
@@ -115,6 +120,13 @@ def build_providers() -> Providers:
         logger.info(
             "collector: TheOddsApi выключен (THE_ODDS_API_ENABLED=false). "
             "Это осознанно: free-tier 500 запросов/мес — включайте только на время сверок."
+        )
+    if settings.onexbet_enabled:
+        odds.append(onexbet)
+    else:
+        logger.info(
+            "collector: 1xBet выключен (ONEXBET_ENABLED=false). Источник кэфов с киберспортом "
+            "на RapidAPI; free-план 500 запросов/мес — включайте осознанно."
         )
 
     providers = Providers(
@@ -130,6 +142,7 @@ def build_providers() -> Providers:
         fight_news=MmaRssProvider(),
         opendota=OpenDotaProvider(),
         liquipedia=LiquipediaProvider(),
+        cito=CitoEsportsProvider(),
     )
     logger.info("collector: конфигурация источников — {}", providers.describe())
     return providers
@@ -171,6 +184,7 @@ async def close_providers(providers: Providers) -> None:
         providers.fight_news,
         providers.opendota,
         providers.liquipedia,
+        providers.cito,
     ]:
         if provider is None:
             continue
@@ -271,6 +285,35 @@ async def upsert_match(
     return row
 
 
+def esports_event_to_match(event: EsportsLiveMatch | Match, sport: str) -> Match | None:
+    """Приводит событие киберспорта к `Match`, который понимает upsert_match.
+
+    Провайдеры киберспорта отдают `EsportsLiveMatch` (team_a/team_b/match_time), а
+    `upsert_match` ждёт `Match` (home_team/away_team/starts_at). Раньше расписание
+    Liquipedia передавалось в upsert_match как есть и падало с AttributeError —
+    исключение ловилось общим `except` и списывалось на «источник недоступен»,
+    то есть киберспорт-расписание не работало вообще.
+    """
+    if isinstance(event, Match):
+        return event
+    if not isinstance(event, EsportsLiveMatch):
+        return None
+    if not event.team_a or not event.team_b or event.match_time is None:
+        return None
+    return Match(
+        ext_id=event.ext_id,
+        sport=sport,
+        league=event.league or "Unknown",
+        league_tier=event.league_tier,
+        home_team=event.team_a,
+        away_team=event.team_b,
+        starts_at=event.match_time,
+        source=event.source,
+        status=MatchStatus.SCHEDULED,
+        extra=dict(event.extra or {}),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Сбор расписания
 # --------------------------------------------------------------------------- #
@@ -285,7 +328,9 @@ async def collect_day_schedule(session: AsyncSession, day: date | None = None, p
     # ---------------------------------------------------------- букмекеры
     for provider in providers.available_odds():
         created = 0
-        for sport in ("football", "hockey", "basketball", "tennis", "mma", "boxing", "dota2", "cs2"):
+        # Только спорты, которые провайдер реально умеет (см. OddsProvider.supported_sports):
+        # запрос по несуществующему спорт-ключу = 404 в пустоту + потерянный лимит free-tier.
+        for sport in provider.supported_sports:
             try:
                 matches = await provider.get_upcoming(sport, day)
             except SourceError as exc:
@@ -300,20 +345,27 @@ async def collect_day_schedule(session: AsyncSession, day: date | None = None, p
         stats[provider.provider_name] = created
         logger.info("collector: {} → {} событий на {}", provider.provider_name, created, day.isoformat())
 
-    # -------------------------------------------------- Liquipedia (киберспорт)
-    if providers.liquipedia and providers.liquipedia.available:
+    # --------------------------------------- Киберспорт: расписание CS2/Dota 2
+    # Основной источник — Cito (замена Liquipedia: у неё ключ вручную и запрет беттинга
+    # на free-tier), Liquipedia остаётся фолбэком, если ключ всё-таки есть.
+    for label, esports in (("cito", providers.cito), ("liquipedia", providers.liquipedia)):
+        if esports is None or not esports.available:
+            continue
         try:
             created = 0
             for sport in ("dota2", "cs2"):
-                for match in await providers.liquipedia.get_upcoming_matches(sport, days=2):
+                for event in await esports.get_upcoming_matches(sport, days=2):
+                    match = esports_event_to_match(event, sport)
+                    if match is None:
+                        continue
                     if not match.league_tier:
-                        # Tier нужен скринеру (только S-Tier/Tier 1 для киберспорта).
-                        match.league_tier = await providers.liquipedia.get_tournament_tier(match.league)
+                        # Tier нужен скринеру (для киберспорта — только S-Tier/Tier 1).
+                        match.league_tier = await esports.get_tournament_tier(match.league, sport=sport)
                     if await upsert_match(session, match, sport_map, matchers):
                         created += 1
-            stats["liquipedia"] = created
+            stats[label] = created
         except Exception as exc:
-            logger.warning("collector: liquipedia недоступна ({})", str(exc)[:200])
+            logger.warning("collector: источник киберспорта {} недоступен ({})", label, str(exc)[:200])
 
     # ------------------------------------------------- BallDontLie (NBA, фолбэк)
     if providers.balldontlie and providers.balldontlie.available:

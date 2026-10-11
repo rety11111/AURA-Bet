@@ -146,6 +146,26 @@ class TeamMatcher:
             self._alias_index = index
         return self._alias_index
 
+    async def _add_alias_once(self, team_id: int, alias: str, source: str) -> bool:
+        """Добавляет alias, если пары (alias, source) ещё нет.
+
+        В таблице `team_aliases` уникальность — по (alias, source) БЕЗ вида спорта
+        (см. app/db/models.py), а матчер создаётся на каждый sport_id. Одна и та же
+        организация в двух видах (например, Team Spirit в CS2 и Dota 2) давала
+        IntegrityError: исключение съедалось общим `except` в коллекторе, и матч
+        терял склейку команд. Теперь повторный alias просто не пишем.
+        """
+        exists = (
+            await self.session.execute(
+                select(TeamAlias.id).where(TeamAlias.alias == alias, TeamAlias.source == source)
+            )
+        ).scalar_one_or_none()
+        if exists is not None:
+            return False
+        self.session.add(TeamAlias(team_id=team_id, alias=alias, source=source))
+        await self.session.flush()
+        return True
+
     async def resolve(self, raw_name: str, source: str) -> Resolution:
         """Находит/создаёт команду. Никогда не склеивает «наугад» (порог 85)."""
         raw_name = str(raw_name or "").strip()
@@ -169,8 +189,7 @@ class TeamMatcher:
 
         if best and best[0] >= self.threshold:
             team_id, canonical = best[1], best[2]
-            self.session.add(TeamAlias(team_id=team_id, alias=raw_name, source=source))
-            await self.session.flush()
+            await self._add_alias_once(team_id, raw_name, source)
             index[normalized] = (team_id, canonical)
             logger.debug(
                 "team_matching: «{}» ({}) → «{}» (id={}, score={:.1f})",
@@ -194,8 +213,7 @@ class TeamMatcher:
         team = Team(sport_id=self.sport_id, canonical_name=raw_name)
         self.session.add(team)
         await self.session.flush()
-        self.session.add(TeamAlias(team_id=team.id, alias=raw_name, source=source))
-        await self.session.flush()
+        await self._add_alias_once(team.id, raw_name, source)
         index = await self._index()
         index[normalize_name(raw_name)] = (team.id, raw_name)
         logger.debug("team_matching: создана команда «{}» (id={}, источник {})", raw_name, team.id, source)
@@ -207,8 +225,7 @@ class TeamMatcher:
 
     async def add_alias(self, team_id: int, alias: str, source: str = "manual") -> None:
         """Ручное добавление alias (используется из скриптов/админских команд)."""
-        self.session.add(TeamAlias(team_id=team_id, alias=alias, source=source))
-        await self.session.flush()
+        await self._add_alias_once(team_id, alias, source)
         if self._alias_index is not None:
             canonical = (
                 await self.session.execute(select(Team.canonical_name).where(Team.id == team_id))
