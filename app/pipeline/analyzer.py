@@ -400,6 +400,16 @@ async def analyze_match(
     if not force and pass_no is not None and await _already_analyzed(session, match.id, pass_no):
         return AnalysisReport(match.id, "skipped", "матч уже анализировался в этом проходе")
 
+    # Лига вне whitelist отсекается на Ур.0 в любом случае — но проверяем это ДО похода
+    # за кэфами, чтобы не жечь лимиты источников (в логах это выглядело как «анализ
+    # сходил за линией → Ур.0 отклонил — лига вне whitelist: MMA»).
+    if not force and not screener.league_allowed(
+        sport_code, match.league, match.league_tier, is_esports=sport_code in ("dota2", "cs2")
+    ):
+        reason = f"лига вне whitelist: {match.league} ({sport_code})"
+        log.info("analyzer: Ур.0 отклонил — {}", reason)
+        return AnalysisReport(match.id, "screener_skip", reason)
+
     # ---------------------------------------------------------------- кэфы
     outcomes = await providers.aggregator.refresh_match(session, match, live=is_live)
     if not outcomes:
@@ -763,19 +773,27 @@ async def _context_stats(
             for injury in (await providers.mma.get_injuries(home_name))[:4]
         ]
     elif sport_code in ("dota2", "cs2"):
-        liquipedia = getattr(providers, "liquipedia", None)
-        if liquipedia and liquipedia.available:
-            esports: dict[str, Any] = {}
+        # Киберспорт-контекст: Cito (основной) → Liquipedia (фолбэк, если есть ключ).
+        esports: dict[str, Any] = {}
+        for source in (getattr(providers, "cito", None), getattr(providers, "liquipedia", None)):
+            if source is None or not source.available:
+                continue
             for key, call in (
-                ("tier", lambda: liquipedia.get_tournament_tier(match.league)),
-                ("roster_home", lambda: liquipedia.get_team_roster(sport_code, home_name)),
-                ("roster_away", lambda: liquipedia.get_team_roster(sport_code, away_name)),
+                ("tier", lambda src=source: src.get_tournament_tier(match.league, sport=sport_code)),
+                ("roster_home", lambda src=source: src.get_team_roster(sport_code, home_name)),
+                ("roster_away", lambda src=source: src.get_team_roster(sport_code, away_name)),
             ):
+                if esports.get(key) is not None:
+                    continue  # уже получено из более приоритетного источника
                 try:
                     esports[key] = await call()
                 except Exception as exc:  # noqa: BLE001 — 404 / открытый Circuit Breaker не валят анализ
-                    logger.warning("analyzer: Liquipedia {} недоступна для match_id={}: {}", key, match.id, exc)
+                    logger.debug(
+                        "analyzer: {} не отдал {} для match_id={}: {}",
+                        getattr(source, "provider_name", type(source).__name__), key, match.id, exc,
+                    )
                     esports[key] = None
+        if any(value is not None for value in esports.values()):
             out["esports"] = esports
     return out
 

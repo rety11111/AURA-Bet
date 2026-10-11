@@ -381,6 +381,16 @@ class JsonBookmakerOddsProvider(OddsProvider):
         super().__init__(source_name=self.provider_name, politeness=True, **kwargs)
 
     @property
+    def supported_sports(self) -> tuple[str, ...]:  # type: ignore[override]
+        """Коллектор обходит только виды спорта, реально настроенные для букмекера.
+
+        Пустой `sport_params` (как в дефолтах Winline/BetBoom) означает «не знаем, что
+        поддерживает сайт» — тогда пробуем весь список кодов спорта.
+        """
+        configured = tuple(self.sport_params)
+        return configured or OddsProvider.supported_sports
+
+    @property
     def available(self) -> bool:
         return bool(self.base_url or self.live_base_url)
 

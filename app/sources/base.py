@@ -17,6 +17,7 @@ import abc
 import asyncio
 import random
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timezone
 from typing import Any, Generic, TypeVar
@@ -26,7 +27,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from app.config import settings
+from app.config import SPORT_CODES, settings
 
 T = TypeVar("T")
 
@@ -46,30 +47,53 @@ class CircuitBreakerOpen(SourceUnavailable):
     """Цепь разомкнута: источник временно отключён из-за последовательных сбоев."""
 
 
+# HTTP-коды, которые имеет смысл повторять с бэкоффом (источник «может ожить»).
+TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
 class CircuitBreaker:
-    """Паттерн Circuit Breaker для изоляции сбойных внешних API."""
+    """Паттерн Circuit Breaker для изоляции сбойных внешних API.
+
+    Размыкание бывает двух видов:
+      * transient — сеть/таймаут/5xx/429: короткая пауза (recovery_time_sec), потому что
+        источник «может ожить» сам;
+      * permanent — детерминированные ошибки (401/403/404/400 и т.п.): конфигурация или
+        запрос заведомо неверны, повтор через 60 секунд ничего не изменит, зато выжигает
+        логи и лимиты. Такие сбои весят больше (permanent_weight) и размыкают цепь
+        надолго (permanent_recovery_time_sec).
+    """
 
     def __init__(
         self,
         name: str,
         failure_threshold: int = 4,
         recovery_time_sec: float = 60.0,
+        permanent_recovery_time_sec: float = 1800.0,
+        permanent_weight: int = 3,
     ) -> None:
         self.name = name
         self.failure_threshold = failure_threshold
         self.recovery_time_sec = recovery_time_sec
+        self.permanent_recovery_time_sec = permanent_recovery_time_sec
+        self.permanent_weight = max(1, permanent_weight)
         self.consecutive_failures = 0
         self.state: str = "CLOSED"  # CLOSED | OPEN | HALF_OPEN
         self.opened_at: float = 0.0
+        self.cooldown_sec: float = recovery_time_sec  # длительность текущего размыкания
 
     def before_request(self) -> None:
         now = time.monotonic()
         if self.state == "OPEN":
-            if now - self.opened_at >= self.recovery_time_sec:
+            passed = now - self.opened_at
+            if passed >= self.cooldown_sec:
                 self.state = "HALF_OPEN"
-                logger.info("circuit_breaker: {} переходит в HALF_OPEN (пробный запрос)", self.name)
+                logger.info(
+                    "circuit_breaker: {} переходит в HALF_OPEN (пробный запрос после {:.0f}с)",
+                    self.name,
+                    self.cooldown_sec,
+                )
             else:
-                remaining = self.recovery_time_sec - (now - self.opened_at)
+                remaining = self.cooldown_sec - passed
                 raise CircuitBreakerOpen(
                     f"{self.name}: circuit breaker OPEN — источник временно отключён на {remaining:.0f}с"
                 )
@@ -79,17 +103,20 @@ class CircuitBreaker:
             logger.info("circuit_breaker: {} восстановился → CLOSED", self.name)
         self.consecutive_failures = 0
         self.state = "CLOSED"
+        self.cooldown_sec = self.recovery_time_sec
 
-    def record_failure(self) -> None:
-        self.consecutive_failures += 1
+    def record_failure(self, permanent: bool = False) -> None:
+        self.consecutive_failures += self.permanent_weight if permanent else 1
         if self.consecutive_failures >= self.failure_threshold:
+            self.cooldown_sec = self.permanent_recovery_time_sec if permanent else self.recovery_time_sec
             self.state = "OPEN"
             self.opened_at = time.monotonic()
             logger.warning(
-                "circuit_breaker: {} зафиксировал {} сбоев подряд → OPEN на {}с",
+                "circuit_breaker: {} зафиксировал {} сбоев подряд → OPEN на {}с{}",
                 self.name,
                 self.consecutive_failures,
-                self.recovery_time_sec,
+                self.cooldown_sec,
+                " (ошибка детерминированная — повтор отложен надолго)" if permanent else "",
             )
 
 
@@ -266,6 +293,40 @@ class MapStats(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Бюджет запросов к внешнему API
+# --------------------------------------------------------------------------- #
+class MonthlyBudget:
+    """Скользящее окно запросов за месяц.
+
+    Нужно источникам с крошечным free-планом (Cito — 500/мес, 1xBet — 500/мес):
+    при исчерпании источник должен ЗАМОЛЧАТЬ до конца окна, а не получать 429 на
+    каждом тике планировщика (именно так выжигались лимиты в проде).
+    """
+
+    def __init__(self, limit: int, window_sec: float = 30 * 24 * 3600.0) -> None:
+        self.limit = max(1, int(limit))
+        self.window_sec = float(window_sec)
+        self._events: deque[float] = deque()
+
+    def take(self, now: float | None = None) -> bool:
+        moment = now if now is not None else time.monotonic()
+        while self._events and moment - self._events[0] > self.window_sec:
+            self._events.popleft()
+        if len(self._events) >= self.limit:
+            return False
+        self._events.append(moment)
+        return True
+
+    @property
+    def used(self) -> int:
+        return len(self._events)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - len(self._events))
+
+
+# --------------------------------------------------------------------------- #
 # TTL-кэш в памяти
 # --------------------------------------------------------------------------- #
 class TTLCache:
@@ -344,7 +405,9 @@ class BaseHttpClient:
         self.circuit_breaker = CircuitBreaker(
             name=self.source_name,
             failure_threshold=max(3, settings.http_max_retries * 2),
-            recovery_time_sec=60.0,
+            recovery_time_sec=settings.http_breaker_recovery_sec,
+            permanent_recovery_time_sec=settings.http_breaker_permanent_cooldown_sec,
+            permanent_weight=settings.http_breaker_permanent_weight,
         )
 
     # ------------------------------------------------------------- lifecycle
@@ -393,12 +456,14 @@ class BaseHttpClient:
         json_body: dict[str, Any] | None = None,
         retries: int | None = None,
         polite: bool | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         self.circuit_breaker.before_request()
         full_url = url if url.startswith("http") else f"{self.base_url}{url}"
         attempts = retries or settings.http_max_retries
         polite = self.politeness if polite is None else polite
         last_error: Exception | None = None
+        permanent = False
 
         try:
             async for attempt in AsyncRetrying(
@@ -408,34 +473,56 @@ class BaseHttpClient:
                 reraise=True,
             ):
                 with attempt:
-                    await self._polite_sleep() if polite else None
+                    if polite:
+                        await self._polite_sleep()
+                    request_kwargs: dict[str, Any] = {
+                        "params": params,
+                        "headers": self._headers(headers),
+                        "json": json_body,
+                    }
+                    if timeout is not None:
+                        request_kwargs["timeout"] = timeout
                     try:
-                        response = await self.client.request(
-                            method,
-                            full_url,
-                            params=params,
-                            headers=self._headers(headers),
-                            json=json_body,
-                        )
+                        response = await self.client.request(method, full_url, **request_kwargs)
                     except (httpx.TransportError, httpx.TimeoutException) as exc:
                         last_error = exc
-                        logger.warning("{}: сеть/таймаут {} — попытка {}", self.source_name, full_url, attempt.retry_state.attempt_number)
+                        logger.warning(
+                            "{}: сеть/таймаут {} — попытка {}",
+                            self.source_name, full_url, attempt.retry_state.attempt_number,
+                        )
                         raise
-                    if response.status_code in (429, 500, 502, 503, 504):
+                    if response.status_code in TRANSIENT_HTTP_STATUSES:
+                        permanent = False
                         last_error = SourceUnavailable(f"{self.source_name}: HTTP {response.status_code}")
                         logger.warning(
-                            "{}: HTTP {} на {} — ретрай {}", self.source_name, response.status_code, full_url,
+                            "{}: HTTP {} на {} — ретрай {}",
+                            self.source_name, response.status_code, full_url,
                             attempt.retry_state.attempt_number,
                         )
                         raise SourceUnavailable(str(last_error))
                     if response.status_code >= 400:
-                        raise SourceError(f"{self.source_name}: HTTP {response.status_code} на {full_url}: {response.text[:200]}")
+                        # Детерминированная ошибка: повтор не поможет, а цепь должна
+                        # разомкнуться надолго (см. CircuitBreaker.record_failure).
+                        permanent = True
+                        raise SourceError(
+                            f"{self.source_name}: HTTP {response.status_code} на {full_url}: {response.text[:200]}"
+                        )
                     self.circuit_breaker.record_success()
                     return response
-        except Exception:
-            self.circuit_breaker.record_failure()
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            # Все ретраи исчерпаны: наружу отдаём SourceError-совместимое исключение,
+            # чтобы вызывающий код (и логи) не видели сырые httpx-трейсбеки.
+            self.circuit_breaker.record_failure(permanent=False)
+            raise SourceUnavailable(
+                f"{self.source_name}: сеть/таймаут {full_url} после {attempts} попыток ({type(exc).__name__})"
+            ) from exc
+        except SourceError:
+            self.circuit_breaker.record_failure(permanent=permanent)
             raise
-        self.circuit_breaker.record_failure()
+        except Exception:
+            self.circuit_breaker.record_failure(permanent=False)
+            raise
+        self.circuit_breaker.record_failure(permanent=False)
         # Сюда попадаем только если AsyncRetrying исчерпал попытки и reraise не сработал.
         raise SourceUnavailable(f"{self.source_name}: не удалось выполнить запрос ({last_error})")
 
@@ -446,8 +533,12 @@ class BaseHttpClient:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         polite: bool | None = None,
+        retries: int | None = None,
+        timeout: float | None = None,
     ) -> Any:
-        response = await self.request("GET", url, params=params, headers=headers, polite=polite)
+        response = await self.request(
+            "GET", url, params=params, headers=headers, polite=polite, retries=retries, timeout=timeout
+        )
         try:
             return response.json()
         except ValueError as exc:
@@ -460,8 +551,12 @@ class BaseHttpClient:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         polite: bool | None = None,
+        retries: int | None = None,
+        timeout: float | None = None,
     ) -> str:
-        response = await self.request("GET", url, params=params, headers=headers, polite=polite)
+        response = await self.request(
+            "GET", url, params=params, headers=headers, polite=polite, retries=retries, timeout=timeout
+        )
         return response.text
 
 
@@ -472,6 +567,10 @@ class OddsProvider(BaseHttpClient, abc.ABC):
     """Источник коэффициентов."""
 
     provider_name = "odds"
+    # Какие виды спорта провайдер реально поддерживает. Collector ходит только по этому
+    # списку: запрос по несуществующему спорт-ключу — это 404/401 в пустоту и потерянные
+    # лимиты free-tier (см. THE_ODDS_API_SPORT_KEYS).
+    supported_sports: tuple[str, ...] = SPORT_CODES
 
     @property
     def available(self) -> bool:

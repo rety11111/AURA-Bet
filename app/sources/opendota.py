@@ -57,9 +57,23 @@ class OpenDotaProvider(EsportsProvider):
     def available(self) -> bool:
         return bool(self.base_url)
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        retries: int | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """GET с деградацией: любая ошибка источника → None и одна строка в логе.
+
+        `retries`/`timeout` нужны лайв-воркеру: он ходит раз в 45 секунд, поэтому
+        /live не должен «висеть» минутами на ретраях (иначе APScheduler пропускает тик).
+        """
         try:
-            return await self.get_json(f"{self.base_url}{path}", params=params or {})
+            return await self.get_json(
+                f"{self.base_url}{path}", params=params or {}, retries=retries, timeout=timeout
+            )
         except SourceError as exc:
             logger.warning("{}: {} недоступен ({})", self.provider_name, path, exc)
             return None
@@ -91,7 +105,11 @@ class OpenDotaProvider(EsportsProvider):
     async def get_live_matches(self, sport: str = "dota2") -> list[EsportsLiveMatch]:
         if sport not in ("dota2", "dota"):
             raise SourceError(f"{self.provider_name}: поддерживает только Dota 2")
-        payload = await self._get("/live")
+        payload = await self._get(
+            "/live",
+            retries=settings.opendota_live_retries,
+            timeout=settings.opendota_live_timeout_sec,
+        )
         if payload is None:
             return []
         await self.hero_names()  # прогреваем справочник, чтобы имена героев были человекочитаемыми

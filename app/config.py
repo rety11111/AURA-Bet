@@ -17,6 +17,7 @@ from functools import lru_cache
 from zoneinfo import ZoneInfo
 from typing import Any, Literal
 
+from loguru import logger
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -175,6 +176,25 @@ class Settings(BaseSettings):
     # включается только как fallback №2 и не чаще quota-лимита (см. theoddsapi.py).
     the_odds_api_enabled: bool = False
     the_odds_api_monthly_limit: int = 450  # держим запас к 500
+    # Сколько не дёргать API после ответа OUT_OF_USAGE_CREDITS / x-requests-remaining: 0.
+    # Лимит free-тарифа месячный, поэтому «пробовать каждую минуту» бессмысленно.
+    the_odds_api_quota_cooldown_hours: float = 12.0
+
+    # ------------------------------------------ 1xBet API (RapidAPI): кэфы, включая киберспорт
+    # Тот же RAPIDAPI_KEY, что у API-Football/Basketball/Tennis (нужна подписка Basic).
+    # ⚠️ free-план — 500 запросов/месяц, поэтому источник по умолчанию ВЫКЛЮЧЕН.
+    onexbet_enabled: bool = False
+    onexbet_rapidapi_host: str = "1xbet-api.p.rapidapi.com"
+    onexbet_monthly_limit: int = 400          # держим запас к 500
+    onexbet_max_leagues_per_sport: int = 2    # у футбола сотни лиг — free-план не выдержит
+    onexbet_cache_ttl_sec: int = 30 * 60      # расписание лиги
+    onexbet_catalog_ttl_sec: int = 24 * 3600  # /sports и /leagues
+    onexbet_odds_ttl_sec: int = 10 * 60       # рынки одного матча
+    # Явные id из GET /sports и /sports/{id}/leagues (JSON). Пример:
+    #   ONEXBET_SPORT_IDS={"cs2": 12345}
+    #   ONEXBET_LEAGUES={"cs2": [111, 222]}
+    onexbet_sport_ids: str = ""
+    onexbet_leagues: str = ""
 
     # ---------------------------------------------------- источник линии (dev)
     # Реальные эндпоинты букмекеров живут ТОЛЬКО здесь. Пусто → провайдер
@@ -192,9 +212,35 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------- free APIs
     liquipedia_user_agent: str = "BetSignalsBot/1.0 (contact: you@example.com)"
-    liquipedia_api_url: str = "https://api.liquipedia.net/api/v3/query"
-    liquipedia_api_key: str = ""  # опционально: v3 может требовать ключ, см. SETUP.md
+    # LPDB API v3 — это REST по типам данных: /match, /tournament, /team, ... (см.
+    # app/sources/liquipedia.py). Эндпоинта /query у Liquipedia НЕТ: он отдаёт HTML 404.
+    liquipedia_api_url: str = "https://api.liquipedia.net/api/v3"
+    # LPDB v3 ОБЯЗАТЕЛЬНО требует ключ (Authorization: Apikey ...): без него API
+    # отвечает ошибкой авторизации. Ключ запрашивается на https://liquipedia.net/api.
+    liquipedia_api_key: str = ""
+    # Free-tier Liquipedia — ~60 запросов/час на ключ. Держим запас и не выжигаем лимит.
+    liquipedia_hourly_limit: int = 50
+    # ------------------------------------------------- Cito API (киберспорт)
+    # Замена Liquipedia: CS2 и Dota 2 — расписание, tier событий, винрейт по картам,
+    # ростеры. Ключ бесплатный (https://citoapi.com), заголовок x-api-key.
+    cito_api_key: str = ""
+    cito_api_base: str = "https://api.citoapi.com/api/v1"
+    # ⚠️ free-план — 500 запросов/месяц. Держим запас и уходим в тишину при исчерпании.
+    cito_monthly_limit: int = 450
+    # Кэш ответов: расписание 30 мин, каталог событий/данные команд — 12 ч (см. cito.py).
+    cito_cache_ttl_sec: int = 1800
+    cito_catalog_ttl_sec: int = 12 * 3600
+    cito_team_ttl_sec: int = 12 * 3600
+    # Лайв-опрос Cito по умолчанию выключен: поллинг каждые 45 с выедает 500 запросов
+    # за пару суток. Включать осознанно и помнить про CITO_LIVE_TTL_SEC.
+    cito_live_enabled: bool = False
+    cito_live_ttl_sec: int = 300
+
     opendota_api_base: str = "https://api.opendota.com/api"
+    # Лайв-воркер крутится каждые LIVE_POLL_SECONDS (45 с), поэтому /live должен
+    # падать быстро: длинные ретраи не дают тику завершиться (APScheduler «skipped»).
+    opendota_live_timeout_sec: float = 12.0
+    opendota_live_retries: int = 1
     nhl_api_base: str = "https://api-web.nhle.com/v1"
     moneypuck_base_url: str = "https://moneypuck.com/moneypuck/playerData"
     understat_base_url: str = "https://understat.com"
@@ -209,6 +255,13 @@ class Settings(BaseSettings):
     http_max_retries: int = 3
     http_backoff_base_sec: float = 1.0
     http_backoff_max_sec: float = 20.0
+    # Circuit breaker: временные сбои (сеть/таймаут/5xx/429) размыкают цепь на
+    # http_breaker_recovery_sec, детерминированные (401/403/404/400) — на
+    # http_breaker_permanent_cooldown_sec и весят в http_breaker_permanent_weight раз
+    # больше: иначе «мёртвый» источник опрашивается каждую минуту и топит лог.
+    http_breaker_recovery_sec: float = 60.0
+    http_breaker_permanent_cooldown_sec: float = 1800.0
+    http_breaker_permanent_weight: int = 3
     # Скрейпинг букмекеров: пауза между запросами и ротация User-Agent.
     scrape_delay_min_sec: float = 2.0
     scrape_delay_max_sec: float = 4.0
@@ -377,6 +430,39 @@ class Settings(BaseSettings):
 
                 logger.error("LEAGUE_WHITELIST_JSON не является валидным JSON — использую дефолтный whitelist")
         return {k: list(v) for k, v in DEFAULT_LEAGUE_WHITELIST.items()}
+
+    # ------------------------------------------------ 1xBet: JSON-настройки из env
+    @property
+    def onexbet_sport_ids_map(self) -> dict[str, int]:
+        """{"cs2": 12345, ...} — привязка наших кодов спорта к sport_id 1xBet."""
+        return {
+            str(sport): int(value)
+            for sport, value in self._json_env(self.onexbet_sport_ids).items()
+            if isinstance(value, (int, float, str)) and str(value).strip().lstrip("-").isdigit()
+        }
+
+    @property
+    def onexbet_leagues_map(self) -> dict[str, list[int]]:
+        """{"cs2": [111, 222], ...} — какие лиги опрашивать у 1xBet (экономия free-плана)."""
+        result: dict[str, list[int]] = {}
+        for sport, value in self._json_env(self.onexbet_leagues).items():
+            if not isinstance(value, list):
+                continue
+            ids = [int(item) for item in value if str(item).strip().lstrip("-").isdigit()]
+            if ids:
+                result[str(sport)] = ids
+        return result
+
+    @staticmethod
+    def _json_env(raw: str) -> dict:
+        if not raw or not raw.strip():
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("config: не удалось разобрать JSON из переменной окружения: {!r}", raw[:120])
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def whitelist_for(self, sport: str) -> list[str]:
         """Ключи whitelist для спорта. Киберспорт хранится под ключами esports_*,

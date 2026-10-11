@@ -111,7 +111,7 @@ def test_migration_0002_alters_tg_id() -> None:
 class _BrokenLiquipedia:
     available = True
 
-    async def get_tournament_tier(self, league: str) -> str:
+    async def get_tournament_tier(self, league: str, sport: str | None = None) -> str:
         raise RuntimeError("404")
 
     async def get_team_roster(self, sport: str, team: str) -> list[str]:
@@ -121,7 +121,7 @@ class _BrokenLiquipedia:
 class _OkLiquipedia:
     available = True
 
-    async def get_tournament_tier(self, league: str) -> str:
+    async def get_tournament_tier(self, league: str, sport: str | None = None) -> str:
         return "S-Tier"
 
     async def get_team_roster(self, sport: str, team: str) -> list[str]:
@@ -136,8 +136,10 @@ async def _esports_ctx(liquipedia: Any) -> dict[str, Any]:
 
 
 async def test_liquipedia_errors_do_not_break_context() -> None:
+    # Источник упал — анализатор не падает и просто не добавляет киберспорт-контекст
+    # (раньше в промпт попадал словарь из одних null).
     out = await _esports_ctx(_BrokenLiquipedia())
-    assert out["esports"] == {"tier": None, "roster_home": None, "roster_away": None}
+    assert "esports" not in out
 
 
 async def test_liquipedia_unavailable_or_missing_is_skipped() -> None:
